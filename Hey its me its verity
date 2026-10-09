@@ -1,0 +1,3732 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TS = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local Lighting = game:GetService("Lighting")
+local UIS = game:GetService("UserInputService")
+local CAS = game:GetService("ContextActionService")
+local SoundService = game:GetService("SoundService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local rng = Random.new()
+
+for _, n in ipairs({"GoreScreenFX", "GoreSettingsUI", "BloodScreenFX"}) do
+    local o = PlayerGui:FindFirstChild(n)
+    if o then o:Destroy() end
+end
+for _, n in ipairs({"GoreCC", "GoreFX", "GoreBlur", "GoreBloom", "GoreDOF", "GoreMuffle"}) do
+    for _, p in ipairs({Lighting, SoundService}) do
+        local o = p:FindFirstChild(n)
+        if o then o:Destroy() end
+    end
+end
+pcall(function() RunService:UnbindFromRenderStep("GoreCamera") end)
+pcall(function() CAS:UnbindAction("GoreCrouch") end)
+pcall(function() CAS:UnbindAction("GoreProne") end)
+
+local DEFAULTS = {
+    BloodAmount = 1.0, BloodLifetime = 40, MaxSplats = 260,
+    WallDrips = true, Footprints = true, BodyBlood = true, ArterialSpray = true,
+    GoreIntensity = 1.0, BloodPoolSize = 1.0, WallSpatterEnabled = true, BloodMistEnabled = true,
+    BloodBrightness = 1.0, BodyBloodAmount = 1.0,
+    BloodTemperature = "Normal", WaterBlood = true, FlyEffects = true, BloodHands = true,
+    ExplosionBloodReaction = true, DeathScream = true, GaspVolume = 2.0,
+    GoreLevel = 2, DeathStyle = "Random", DeathCamera = true, LoseLimbs = true,
+    Bandages = true, Debris = true, ChunkForce = 1.0, ChunkLifetime = 18, RagdollForce = 1.0,
+    ChunkCount = 1.0,
+    CameraEffects = true, HeadBob = 1.0, CameraShake = 1.0, CameraRoll = 1.0,
+    DynamicFOV = true, BaseFOV = 70, HideHeadFP = true,
+    CameraNoise = 0.5, LandingShake = 1.0,
+    Stance = true, AutoStance = true, CrouchSpeed = 0.55, CrawlSpeed = 0.28,
+    WoundedCrawl = true, InjuryAnimations = true, ShrinkCollision = true,
+    ScreenFX = true, Vignette = true, ScreenBlood = true, ScreenBloodAmount = 1.0,
+    ScreenCrackEnabled = true, DamageNumbers = true, ColorGrading = true, BlurFX = true,
+    DepthOfField = true, VignetteIntensity = 1.0, DamageNumberScale = 1.0,
+    SFXVolume = 1.0, HeartbeatSFX = true, HeartbeatVolume = 1.4, Muffle = true, Voices = true,
+    DeafnessStrength = 1.0, DeafnessDuration = 4, TinnitusChance = 0.35,
+    WhimperVolume = 1.0, AdrenalineEnabled = true,
+    Quality = 2,
+    EyeBlood = true, DoublVision = true, ChromAberration = true,
+    BreathingVignette = true, HypoxicTunnel = true, FilmGrain = true,
+    WoundOcclusion = true, DiopticBlur = true, LensTilt = true, DeathFlashbacks = true,
+    ViscosityBlood = true, LungFoam = true, CeilingBloodDrip = true,
+    BleedVapor = true, ArterialAttach = true, WallSmear = true,
+    ArchedFootprint = true, RainBlood = true, PoolSkin = true,
+    InsectAttract = true, StumpBleed = true, PoolMerge = true,
+    DirectionalTinnitus = true, BleedingLoop = true,
+}
+
+local S = {}
+for k, v in pairs(DEFAULTS) do S[k] = v end
+
+local SAVE_FILE = "GoreV11_Settings.json"
+local ChangedListeners = {}
+
+local function onSettingChanged(key, fn)
+    ChangedListeners[key] = ChangedListeners[key] or {}
+    table.insert(ChangedListeners[key], fn)
+end
+
+local function saveSettings()
+    pcall(function()
+        writefile(SAVE_FILE, HttpService:JSONEncode(S))
+    end)
+end
+
+local function loadSettings()
+    pcall(function()
+        if isfile and isfile(SAVE_FILE) then
+            local data = HttpService:JSONDecode(readfile(SAVE_FILE))
+            for k, v in pairs(data) do
+                if DEFAULTS[k] ~= nil and typeof(v) == typeof(DEFAULTS[k]) then S[k] = v end
+            end
+        end
+    end)
+end
+loadSettings()
+
+local function setSetting(key, value)
+    S[key] = value
+    local l = ChangedListeners[key]
+    if l then
+        for _, f in ipairs(l) do task.spawn(f, value) end
+    end
+end
+
+local function OPT()
+    return ({0.45, 0.8, 1.15})[S.Quality] * S.BloodAmount * S.GoreIntensity
+end
+
+local function clamp(x, a, b) return math.max(a, math.min(b, x)) end
+local function lerp(a, b, t) return a + (b - a) * t end
+local function damp(cur, target, rate, dt) return cur + (target - cur) * (1 - math.exp(-rate * dt)) end
+local function rnd(a, b) return rng:NextNumber(a, b) end
+local function pick(t) return t[rng:NextInteger(1, #t)] end
+
+local function randDir()
+    local v = Vector3.new(rnd(-1, 1), rnd(-1, 1), rnd(-1, 1))
+    if v.Magnitude < 0.05 then return Vector3.yAxis end
+    return v.Unit
+end
+
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    if props then
+        for k, v in pairs(props) do o[k] = v end
+    end
+    if parent then o.Parent = parent end
+    return o
+end
+
+local function isVisuallySolid(inst)
+    if not inst or not inst:IsA("BasePart") then return true end
+    if inst.Transparency >= 0.98 then return false end
+    if inst.LocalTransparencyModifier >= 0.98 then return false end
+    if inst.CanQuery == false then return false end
+    return true
+end
+
+local function raycastVisible(origin, direction, params, maxHits)
+    maxHits = maxHits or 10
+    local curOrigin = origin
+    local curDir = direction
+    local dirMag = curDir.Magnitude
+    if dirMag < 0.001 then return nil end
+    for _ = 1, maxHits do
+        local hit = workspace:Raycast(curOrigin, curDir, params)
+        if not hit then return nil end
+        if isVisuallySolid(hit.Instance) then return hit end
+        local step = curDir.Unit * 0.06
+        local newOrigin = hit.Position + step
+        local remainder = (curOrigin + curDir) - newOrigin
+        if remainder.Magnitude < 0.05 then return nil end
+        curOrigin = newOrigin
+        curDir = remainder
+    end
+    return nil
+end
+
+local Spring = {}
+Spring.__index = Spring
+function Spring.new(k, d)
+    return setmetatable({k = k, d = d, p = Vector3.zero, v = Vector3.zero}, Spring)
+end
+function Spring:step(dt)
+    dt = math.min(dt, 1 / 30)
+    local a = -self.p * self.k - self.v * self.d
+    self.v = self.v + a * dt
+    self.p = self.p + self.v * dt
+    return self.p
+end
+function Spring:kick(v) self.v = self.v + v end
+
+local function newNV(initial)
+    local nv = Instance.new("NumberValue")
+    nv.Value = initial or 0
+    return nv
+end
+local function numTween(nv, goal, t, style, dir)
+    local tw = TS:Create(nv, TweenInfo.new(t, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), {Value = goal})
+    tw:Play()
+    return tw
+end
+
+local function surfaceCF(pos, normal, spin)
+    local ref = math.abs(normal.Y) > 0.95 and Vector3.xAxis or Vector3.yAxis
+    local right = ref:Cross(normal).Unit
+    return CFrame.fromMatrix(pos, right, normal) * CFrame.Angles(0, spin or 0, 0)
+end
+
+local BloodFolder = workspace:FindFirstChild("BloodParticles")
+if not BloodFolder then
+    BloodFolder = new("Folder", {Name = "BloodParticles"}, workspace)
+end
+BloodFolder:ClearAllChildren()
+
+local splatSounds = {"rbxassetid://9114223178", "rbxassetid://9114223280", "rbxassetid://9114223405"}
+local fleshSounds = {"rbxassetid://132080416777849", "rbxassetid://262562442", "rbxassetid://231917744"}
+local bleedingSounds = {"rbxassetid://119851057500597", "rbxassetid://8164951181", "rbxassetid://145421497", "rbxassetid://137091131"}
+local gurglingSounds = {"rbxassetid://145112903", "rbxassetid://149368744", "rbxassetid://133908410"}
+local boneBreakSounds = {"rbxassetid://386805022"}
+local dripSounds = {"rbxassetid://137091131", "rbxassetid://145421497"}
+local whimperSounds = {"rbxassetid://262562442", "rbxassetid://231917744"}
+local healSounds = {"rbxassetid://5658462870", "rbxassetid://5658462660"}
+local tinnitusSound = "rbxassetid://5679513201"
+local HEARTBEAT_THUMP = "rbxassetid://9043365842"
+local DEATH_SCREAM = "rbxassetid://93099775435838"
+local WOUNDED_GASP = "rbxassetid://8152642803"
+local MIST_TEX = "rbxasset://textures/particles/smoke_main.dds"
+local DROP_TEX = "rbxassetid://243664672"
+
+local WET_BLOOD = Color3.fromRGB(150, 6, 8)
+local DRY_BLOOD = Color3.fromRGB(58, 4, 4)
+
+local function updateBloodColors()
+    local b = S.BloodBrightness or 1
+    local wet = Color3.new(clamp(150 / 255 * b, 0, 1), clamp(6 / 255 * b, 0, 1), clamp(8 / 255 * b, 0, 1))
+    local dry = Color3.new(clamp(58 / 255 * b, 0, 1), clamp(4 / 255 * b, 0, 1), clamp(4 / 255 * b, 0, 1))
+    if S.BloodTemperature == "Frozen" then
+        wet = Color3.new(clamp(0.22 * b, 0, 1), clamp(0.04 * b, 0, 1), clamp(0.07 * b, 0, 1))
+        dry = Color3.new(clamp(0.10 * b, 0, 1), clamp(0.025 * b, 0, 1), clamp(0.035 * b, 0, 1))
+    elseif S.BloodTemperature == "Boiling" then
+        wet = Color3.new(clamp(0.72 * b, 0, 1), clamp(0.025 * b, 0, 1), clamp(0.018 * b, 0, 1))
+        dry = Color3.new(clamp(0.30 * b, 0, 1), clamp(0.015 * b, 0, 1), clamp(0.012 * b, 0, 1))
+    end
+    WET_BLOOD, DRY_BLOOD = wet, dry
+end
+updateBloodColors()
+onSettingChanged("BloodBrightness", updateBloodColors)
+onSettingChanged("BloodTemperature", updateBloodColors)
+
+local Deaf = {amount = 0, side = 0, timer = 0}
+
+local function deafen(amount, side, duration)
+    Deaf.amount = math.max(Deaf.amount, clamp(amount, 0, 1))
+    if side and side ~= 0 then Deaf.side = side end
+    Deaf.timer = math.max(Deaf.timer, duration or S.DeafnessDuration)
+end
+
+local function signOf(x) if x > 0 then return 1 elseif x < 0 then return -1 else return 0 end end
+
+local function directionalVolume(worldPos, baseVol)
+    local a = Deaf.amount
+    if a < 0.01 then return baseVol end
+    local cam = workspace.CurrentCamera
+    if not cam then return baseVol * (1 - a * 0.7) end
+    local toSound = worldPos - cam.CFrame.Position
+    if toSound.Magnitude < 1 then return baseVol * (1 - a * 0.5) end
+    toSound = toSound.Unit
+    local sideDot = toSound:Dot(cam.CFrame.RightVector)
+    local nearEar = 0.5
+    if Deaf.side ~= 0 then
+        nearEar = (sideDot * Deaf.side + 1) * 0.5
+    end
+    local atten = a * (0.4 + 0.6 * nearEar)
+    return baseVol * (1 - atten)
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    if Deaf.timer > 0 then
+        Deaf.timer = Deaf.timer - dt
+        Deaf.amount = clamp(Deaf.amount - dt / math.max(S.DeafnessDuration, 0.5), 0, 1)
+    else
+        Deaf.amount = math.max(0, Deaf.amount - dt * 0.3)
+    end
+end)
+
+local muffle = new("EqualizerSoundEffect", {Name = "GoreMuffle", HighGain = 0, MidGain = 0, LowGain = 0}, SoundService)
+
+local Audio = {}
+
+function Audio.at(pos, ids, vol, p1, p2, range)
+    if typeof(ids) == "table" then ids = pick(ids) end
+    if not ids then return end
+    local att = new("Attachment", nil, workspace.Terrain)
+    att.WorldPosition = pos
+    local baseVol = clamp((vol or 1) * S.SFXVolume, 0, 4)
+    local s = new("Sound", {
+        SoundId = ids,
+        Volume = directionalVolume(pos, baseVol),
+        PlaybackSpeed = rnd(p1 or 0.9, p2 or 1.1),
+        RollOffMinDistance = 8,
+        RollOffMaxDistance = range or 110,
+        RollOffMode = Enum.RollOffMode.InverseTapered,
+    }, att)
+    local up = workspace:Raycast(pos, Vector3.new(0, 30, 0))
+    if up then
+        new("ReverbSoundEffect", {DecayTime = 1.4, Density = 0.8, Diffusion = 0.8, DryLevel = 0, WetLevel = -9}, s)
+    end
+    s:Play()
+    Debris:AddItem(att, 6)
+    return s
+end
+
+function Audio.ui(ids, vol, speed)
+    if typeof(ids) == "table" then ids = pick(ids) end
+    if not ids then return end
+    local s = new("Sound", {SoundId = ids, Volume = clamp((vol or 1) * S.SFXVolume, 0, 4), PlaybackSpeed = speed or 1}, SoundService)
+    s:Play()
+    Debris:AddItem(s, 6)
+    return s
+end
+
+function Audio.impact(pos, heavy)
+    Audio.at(pos, splatSounds, heavy and 0.8 or 0.45, 0.85, 1.15)
+    if heavy then
+        Audio.at(pos, fleshSounds, 0.9, 0.55, 0.75)
+    end
+end
+
+local Post = {}
+Post.cc = new("ColorCorrectionEffect", {Name = "GoreCC"}, Lighting)
+Post.blur = new("BlurEffect", {Name = "GoreBlur", Size = 0}, Lighting)
+Post.bloom = new("BloomEffect", {Name = "GoreBloom", Intensity = 0, Size = 24, Threshold = 2}, Lighting)
+Post.dof = new("DepthOfFieldEffect", {Name = "GoreDOF", FarIntensity = 0, NearIntensity = 0, FocusDistance = 25, InFocusRadius = 40}, Lighting)
+Post.sat = newNV(0)
+Post.tint = newNV(0)
+Post.blurT = newNV(0)
+Post.bloomT = newNV(0)
+Post.muffleT = newNV(0)
+Post.fov = newNV(0)
+
+function Post.update(hp, dead)
+    local low = dead and 0 or clamp((0.4 - hp) / 0.4, 0, 1)
+    if not S.ScreenFX then low = 0 end
+    local useCC = S.ScreenFX and S.ColorGrading
+    Post.cc.Saturation = useCC and clamp(-(low * 0.6) - Post.sat.Value, -1, 1) or 0
+    Post.cc.Contrast = useCC and clamp(low * 0.12, -1, 1) or 0
+    Post.cc.Brightness = useCC and clamp(-low * 0.04, -1, 1) or 0
+    local tint = useCC and clamp(low * 0.22 + Post.tint.Value * 0.4, 0, 0.9) or 0
+    Post.cc.TintColor = Color3.new(1, clamp(1 - tint, 0, 1), clamp(1 - tint * 1.1, 0, 1))
+    Post.blur.Size = (S.ScreenFX and S.BlurFX) and math.max(Post.blurT.Value, low * 3) or 0
+    Post.bloom.Intensity = S.ScreenFX and Post.bloomT.Value or 0
+    local dofOn = S.ScreenFX and S.DepthOfField
+    Post.dof.FarIntensity = dofOn and low * 0.45 or 0
+    Post.dof.FocusDistance = 18
+    local m = S.Muffle and (low * 1 + Post.muffleT.Value + Deaf.amount) or Deaf.amount
+    muffle.HighGain = -clamp(m, 0, 1) * 32
+    muffle.MidGain = -clamp(m, 0, 1) * 7
+    muffle.LowGain = -clamp(m, 0, 1) * 3
+end
+
+local screenGui = new("ScreenGui", {
+    Name = "GoreScreenFX", ResetOnSpawn = false, IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 5,
+}, PlayerGui)
+
+local function overlay(color, z)
+    return new("Frame", {
+        Size = UDim2.fromScale(1, 1), BackgroundColor3 = color, BackgroundTransparency = 1,
+        BorderSizePixel = 0, ZIndex = z,
+    }, screenGui)
+end
+
+local function makeVignette(color, z)
+    local group = {frames = {}}
+    local defs = {
+        {UDim2.fromScale(1, 0.38), UDim2.fromScale(0, 0), 90},
+        {UDim2.fromScale(1, 0.38), UDim2.fromScale(0, 0.62), -90},
+        {UDim2.fromScale(0.3, 1), UDim2.fromScale(0, 0), 0},
+        {UDim2.fromScale(0.3, 1), UDim2.fromScale(0.7, 0), 180},
+    }
+    for _, d in ipairs(defs) do
+        local f = new("Frame", {
+            Size = d[1], Position = d[2], BackgroundColor3 = color,
+            BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = z,
+        }, screenGui)
+        new("UIGradient", {
+            Rotation = d[3],
+            Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1)}),
+        }, f)
+        table.insert(group.frames, f)
+    end
+    function group.set(a)
+        for _, f in ipairs(group.frames) do f.BackgroundTransparency = 1 - clamp(a, 0, 1) end
+    end
+    return group
+end
+
+local vigDark = makeVignette(Color3.new(0, 0, 0), 2)
+local vigBlood = makeVignette(Color3.fromRGB(115, 0, 0), 3)
+local dmgFlash = overlay(Color3.fromRGB(190, 8, 8), 4)
+local healFlash = overlay(Color3.fromRGB(80, 255, 130), 8)
+local numbersLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 10}, screenGui)
+local crackLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 12}, screenGui)
+local lensLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 13}, screenGui)
+local deathFlash = overlay(Color3.new(0, 0, 0), 20)
+
+local eyeBloodLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 14}, screenGui)
+local doubleVisionVP = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 6}, screenGui)
+local chromaLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 7}, screenGui)
+local vigScaleFrame = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 2}, screenGui)
+local tunnelLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 15}, screenGui)
+local grainLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 16}, screenGui)
+local flashbackLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 22}, screenGui)
+local lensGravLayer = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 13}, screenGui)
+
+local chromR = new("Frame", {
+    Size = UDim2.fromScale(1.006, 1.006), Position = UDim2.fromScale(-0.003, -0.001),
+    BackgroundColor3 = Color3.fromRGB(255, 0, 0), BackgroundTransparency = 1,
+    BorderSizePixel = 0, ZIndex = 7,
+}, chromaLayer)
+local chromG = new("Frame", {
+    Size = UDim2.fromScale(1.000, 1.000), Position = UDim2.fromScale(0, 0),
+    BackgroundColor3 = Color3.fromRGB(0, 255, 0), BackgroundTransparency = 1,
+    BorderSizePixel = 0, ZIndex = 7,
+}, chromaLayer)
+local chromB = new("Frame", {
+    Size = UDim2.fromScale(1.006, 1.006), Position = UDim2.fromScale(0.003, 0.001),
+    BackgroundColor3 = Color3.fromRGB(0, 0, 255), BackgroundTransparency = 1,
+    BorderSizePixel = 0, ZIndex = 7,
+}, chromaLayer)
+
+local tunnelCircle = new("Frame", {
+    Size = UDim2.fromScale(0, 0), AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 1,
+    BorderSizePixel = 0, ZIndex = 15,
+}, tunnelLayer)
+new("UICorner", {CornerRadius = UDim.new(1, 0)}, tunnelCircle)
+local tunnelBorder = new("Frame", {
+    Size = UDim2.fromScale(1, 1), Position = UDim2.fromScale(0, 0),
+    BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 1,
+    BorderSizePixel = 0, ZIndex = 15,
+}, tunnelLayer)
+
+local GRAIN_COUNT = 80
+local grainPixels = {}
+for i = 1, GRAIN_COUNT do
+    local gp = new("Frame", {
+        Size = UDim2.fromOffset(rng:NextInteger(2, 5), rng:NextInteger(2, 5)),
+        Position = UDim2.fromScale(rnd(0, 1), rnd(0, 1)),
+        BackgroundColor3 = rng:NextNumber() < 0.5 and Color3.new(1,1,1) or Color3.new(0,0,0),
+        BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 16,
+    }, grainLayer)
+    grainPixels[i] = gp
+end
+
+local LENS_DROP_COUNT = 12
+local lensDrops = {}
+for i = 1, LENS_DROP_COUNT do
+    local ld = new("Frame", {
+        Size = UDim2.fromOffset(rng:NextInteger(4, 9), rng:NextInteger(18, 40)),
+        Position = UDim2.fromScale(rnd(0.05, 0.95), rnd(0, 0.8)),
+        BackgroundColor3 = Color3.fromRGB(rng:NextInteger(100, 160), 3, 5),
+        BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 13,
+    }, lensGravLayer)
+    new("UICorner", {CornerRadius = UDim.new(1, 0)}, ld)
+    lensDrops[i] = {frame = ld, active = false, posY = rnd(0, 0.8), posX = rnd(0.05, 0.95)}
+end
+
+local eyeBlurLeft = new("Frame", {
+    Size = UDim2.fromScale(0.5, 1), Position = UDim2.fromScale(0, 0),
+    BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 1,
+    BorderSizePixel = 0, ZIndex = 9,
+}, screenGui)
+local eyeBlurRight = new("Frame", {
+    Size = UDim2.fromScale(0.5, 1), Position = UDim2.fromScale(0.5, 0),
+    BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 1,
+    BorderSizePixel = 0, ZIndex = 9,
+}, screenGui)
+new("UIGradient", {
+    Rotation = 0,
+    Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.0), NumberSequenceKeypoint.new(1, 1)}),
+}, eyeBlurLeft)
+new("UIGradient", {
+    Rotation = 180,
+    Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.0), NumberSequenceKeypoint.new(1, 1)}),
+}, eyeBlurRight)
+
+local doubleFrame = new("Frame", {
+    Size = UDim2.fromScale(1, 1), Position = UDim2.fromOffset(0, 0),
+    BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1,
+    BorderSizePixel = 0, ZIndex = 6,
+}, doubleVisionVP)
+local doubleShift = new("ImageLabel", {
+    Size = UDim2.fromScale(1, 1), Position = UDim2.fromOffset(3, 3),
+    BackgroundTransparency = 1, ImageTransparency = 1,
+    ZIndex = 6, Image = "",
+}, doubleVisionVP)
+
+local FX_V11 = {
+    eyeBloodSide = 0,
+    eyeBloodAlpha = 0,
+    doubleVisionAlpha = 0,
+    doubleVisionTimer = 0,
+    chromIntensity = 0,
+    tunnelAlpha = 0,
+    grainIntensity = 0,
+    diopticSide = 0,
+    diopticAlpha = 0,
+    lensDropsActive = false,
+    lensDropTimer = 0,
+}
+
+local FX = {
+    edge = 0, impulse = newNV(0), hbEnv = 0, hbPhase = 0, beat1 = false, beat2 = false,
+}
+
+local function round(inst, r)
+    new("UICorner", {CornerRadius = r or UDim.new(1, 0)}, inst)
+end
+
+function FX.flash(i)
+    if not S.ScreenFX then return end
+    dmgFlash.BackgroundTransparency = 1 - clamp(i, 0.1, 0.75)
+    TS:Create(dmgFlash, TweenInfo.new(0.35), {BackgroundTransparency = 1}):Play()
+end
+
+function FX.hit(ratio)
+    if not S.ScreenFX then return end
+    FX.flash(clamp(ratio * 3, 0.2, 0.7))
+    FX.impulse.Value = clamp(ratio * 3, 0.25, 1)
+    numTween(FX.impulse, 0, 0.9)
+    Post.tint.Value = clamp(ratio * 2.5, 0.2, 1)
+    numTween(Post.tint, 0, 0.7)
+    Post.bloomT.Value = clamp(ratio * 1.5, 0.15, 0.7)
+    numTween(Post.bloomT, 0, 0.3)
+    Post.blurT.Value = clamp(ratio * 14, 1, 8)
+    numTween(Post.blurT, 0, 0.5)
+end
+
+function FX.addEdge(a)
+    FX.edge = clamp(FX.edge + a, 0, 1)
+end
+
+function FX.reset()
+    FX.edge = 0
+    deathFlash.BackgroundTransparency = 1
+    dmgFlash.BackgroundTransparency = 1
+    lensLayer:ClearAllChildren()
+    crackLayer:ClearAllChildren()
+    Post.fov.Value = 0
+    Post.sat.Value = 0
+    Post.blurT.Value = 0
+    Post.muffleT.Value = 0
+    eyeBloodLayer:ClearAllChildren()
+    flashbackLayer:ClearAllChildren()
+    doubleFrame.BackgroundTransparency = 1
+    chromR.BackgroundTransparency = 1
+    chromG.BackgroundTransparency = 1
+    chromB.BackgroundTransparency = 1
+    tunnelBorder.BackgroundTransparency = 1
+    eyeBlurLeft.BackgroundTransparency = 1
+    eyeBlurRight.BackgroundTransparency = 1
+    for _, d in ipairs(lensDrops) do
+        d.active = false
+        d.frame.BackgroundTransparency = 1
+    end
+    for _, gp in ipairs(grainPixels) do gp.BackgroundTransparency = 1 end
+    FX_V11.eyeBloodAlpha = 0
+    FX_V11.doubleVisionTimer = 0
+    FX_V11.chromIntensity = 0
+    FX_V11.grainIntensity = 0
+    FX_V11.lensDropsActive = false
+end
+
+function FX.lensBlood(intensity)
+    if not (S.ScreenFX and S.ScreenBlood) then return end
+    local n = clamp(math.floor(intensity * 3 * OPT() * S.ScreenBloodAmount + 0.5), 1, 6)
+    for _ = 1, n do
+        local base = rnd(34, 90) * (0.7 + intensity * 0.4)
+        local root = new("Frame", {
+            BackgroundTransparency = 1, Size = UDim2.fromOffset(0, 0), ZIndex = 13,
+            Position = UDim2.fromScale(rnd(0.08, 0.92), rnd(0.05, 0.7)),
+        }, lensLayer)
+        local parts = {}
+        for _ = 1, rng:NextInteger(3, 6) do
+            local d = base * rnd(0.35, 1)
+            local b = new("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0, ZIndex = 13,
+                Position = UDim2.fromOffset(rnd(-base * 0.6, base * 0.6), rnd(-base * 0.6, base * 0.6)),
+                Size = UDim2.fromOffset(d, d), BackgroundTransparency = 0.1,
+                BackgroundColor3 = Color3.fromRGB(rng:NextInteger(95, 150), 4, 6),
+            }, root)
+            round(b)
+            table.insert(parts, b)
+        end
+        local drip = new("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0), BorderSizePixel = 0, ZIndex = 13,
+            Size = UDim2.fromOffset(base * 0.2, base * 0.3), BackgroundTransparency = 0.1,
+            BackgroundColor3 = Color3.fromRGB(110, 3, 5),
+        }, root)
+        round(drip)
+        table.insert(parts, drip)
+        TS:Create(drip, TweenInfo.new(rnd(3, 6), Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Size = UDim2.fromOffset(base * 0.16, base * rnd(2, 4)),
+        }):Play()
+        local life = rnd(5, 8)
+        task.delay(life * 0.55, function()
+            for _, p in ipairs(parts) do
+                if p.Parent then
+                    TS:Create(p, TweenInfo.new(life * 0.45), {BackgroundTransparency = 1}):Play()
+                end
+            end
+        end)
+        Debris:AddItem(root, life + 0.2)
+    end
+end
+
+function FX.crack(intensity)
+    if not (S.ScreenFX and S.ScreenCrackEnabled) then return end
+    local ox, oy = rnd(0.2, 0.8), rnd(0.2, 0.8)
+    local branches = clamp(math.floor(intensity * 5 * OPT()), 3, 9)
+    for _ = 1, branches do
+        local ang = rnd(0, 360)
+        local len = rnd(80, 320) * intensity
+        local f = new("Frame", {
+            AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(ox, oy),
+            Size = UDim2.fromOffset(len, rnd(1, 2.5)), Rotation = ang, BorderSizePixel = 0,
+            BackgroundColor3 = Color3.fromRGB(235, 235, 245), BackgroundTransparency = 0.25, ZIndex = 12,
+        }, crackLayer)
+        TS:Create(f, TweenInfo.new(2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {BackgroundTransparency = 1}):Play()
+        Debris:AddItem(f, 2.1)
+    end
+end
+
+function FX.damageNumber(amount, crit)
+    if not (S.ScreenFX and S.DamageNumbers) then return end
+    local sc = S.DamageNumberScale
+    local label = new("TextLabel", {
+        Size = UDim2.fromOffset(180 * sc, 60 * sc), BackgroundTransparency = 1, Font = Enum.Font.GothamBlack,
+        Position = UDim2.fromScale(rnd(0.35, 0.65), rnd(0.35, 0.6)), Text = "-" .. math.floor(amount),
+        TextColor3 = crit and Color3.fromRGB(255, 40, 40) or Color3.fromRGB(225, 60, 60),
+        TextStrokeTransparency = 0.3, TextScaled = true, ZIndex = 11,
+    }, numbersLayer)
+    TS:Create(label, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Position = label.Position - UDim2.fromScale(0, 0.18), TextTransparency = 1, TextStrokeTransparency = 1,
+    }):Play()
+    Debris:AddItem(label, 1.4)
+end
+
+function FX.heal(intensity)
+    if not S.ScreenFX then return end
+    intensity = clamp(intensity or 0.3, 0.1, 0.5)
+    healFlash.BackgroundTransparency = 1 - intensity
+    TS:Create(healFlash, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency = 1}):Play()
+    task.spawn(function()
+        for _ = 1, 8 do
+            local p = new("Frame", {
+                Size = UDim2.fromOffset(rng:NextInteger(6, 14), rng:NextInteger(6, 14)), BorderSizePixel = 0,
+                Position = UDim2.fromScale(rnd(0, 1), rnd(0.6, 1)), BackgroundColor3 = Color3.fromRGB(100, 255, 150),
+                BackgroundTransparency = 0.2, ZIndex = 9,
+            }, screenGui)
+            round(p)
+            TS:Create(p, TweenInfo.new(rnd(1, 2), Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                Position = p.Position - UDim2.fromScale(0, 0.3), BackgroundTransparency = 1, Size = UDim2.fromOffset(20, 20),
+            }):Play()
+            Debris:AddItem(p, 2)
+            task.wait(0.08)
+        end
+    end)
+    Audio.ui(healSounds, 0.6)
+end
+
+function FX.tinnitus()
+    local s = Audio.ui(tinnitusSound, 0.55, 1)
+    task.delay(2.2, function() if s and s.Parent then TS:Create(s, TweenInfo.new(1.4), {Volume = 0}):Play() end end)
+    Post.muffleT.Value = 0.9
+    numTween(Post.muffleT, 0, S.DeafnessDuration)
+    Post.blurT.Value = 5
+    numTween(Post.blurT, 0, 1.8)
+end
+
+function FX.eyeBlood(side)
+    if not (S.ScreenFX and S.EyeBlood) then return end
+    FX_V11.eyeBloodSide = side
+    FX_V11.eyeBloodAlpha = 1
+    eyeBloodLayer:ClearAllChildren()
+    local posX = side < 0 and 0 or 0.5
+    local smear = new("Frame", {
+        Size = UDim2.fromScale(0.5, 1), Position = UDim2.fromScale(posX, 0),
+        BackgroundColor3 = Color3.fromRGB(130, 5, 8), BackgroundTransparency = 0.45,
+        BorderSizePixel = 0, ZIndex = 14,
+    }, eyeBloodLayer)
+    new("UIGradient", {
+        Rotation = side < 0 and 0 or 180,
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.3),
+            NumberSequenceKeypoint.new(0.5, 0.55),
+            NumberSequenceKeypoint.new(1, 1),
+        }),
+    }, smear)
+    for _ = 1, rng:NextInteger(3, 6) do
+        local drip = new("Frame", {
+            Size = UDim2.fromOffset(rng:NextInteger(6, 18), rng:NextInteger(40, 140)),
+            Position = UDim2.fromScale(posX + rnd(0, 0.45), rnd(0, 0.4)),
+            BackgroundColor3 = Color3.fromRGB(rng:NextInteger(90, 150), 3, 5),
+            BackgroundTransparency = 0.3, BorderSizePixel = 0, ZIndex = 14,
+        }, eyeBloodLayer)
+        new("UICorner", {CornerRadius = UDim.new(0, 4)}, drip)
+        TS:Create(drip, TweenInfo.new(rnd(4, 10), Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+            Size = drip.Size + UDim2.fromOffset(0, rng:NextInteger(30, 90)),
+        }):Play()
+    end
+    task.delay(8, function()
+        TS:Create(smear, TweenInfo.new(4), {BackgroundTransparency = 1}):Play()
+        task.delay(4, function() eyeBloodLayer:ClearAllChildren() end)
+    end)
+end
+
+function FX.doubleVision(duration)
+    if not (S.ScreenFX and S.DoublVision) then return end
+    FX_V11.doubleVisionAlpha = 1
+    FX_V11.doubleVisionTimer = duration or 3
+    doubleFrame.BackgroundTransparency = 0.80
+    doubleFrame.Position = UDim2.fromOffset(rng:NextInteger(2, 4), rng:NextInteger(1, 3))
+    TS:Create(doubleFrame, TweenInfo.new(duration or 3, Enum.EasingStyle.Quad), {
+        BackgroundTransparency = 1
+    }):Play()
+end
+
+function FX.chromAberration(intensity)
+    if not (S.ScreenFX and S.ChromAberration) then return end
+    intensity = clamp(intensity, 0, 1)
+    local alpha = intensity * 0.22
+    local shift = intensity * 0.004
+    chromR.BackgroundTransparency = 1 - alpha
+    chromG.BackgroundTransparency = 1 - alpha * 0.5
+    chromB.BackgroundTransparency = 1 - alpha
+    chromR.Position = UDim2.fromScale(-shift, -shift * 0.5)
+    chromB.Position = UDim2.fromScale(shift, shift * 0.5)
+    FX_V11.chromIntensity = intensity
+    task.spawn(function()
+        local steps = 12
+        for i = 1, steps do
+            task.wait(0.05)
+            local t = 1 - i / steps
+            local a2 = t * alpha
+            local s2 = t * shift
+            chromR.BackgroundTransparency = 1 - a2
+            chromG.BackgroundTransparency = 1 - a2 * 0.5
+            chromB.BackgroundTransparency = 1 - a2
+            chromR.Position = UDim2.fromScale(-s2, -s2 * 0.5)
+            chromB.Position = UDim2.fromScale(s2, s2 * 0.5)
+        end
+        FX_V11.chromIntensity = 0
+    end)
+end
+
+function FX.diopticBlur(side, intensity)
+    if not (S.ScreenFX and S.DiopticBlur) then return end
+    FX_V11.diopticSide = side
+    FX_V11.diopticAlpha = clamp(intensity or 0.7, 0, 1)
+    local alpha = 1 - FX_V11.diopticAlpha
+    if side < 0 then
+        eyeBlurLeft.BackgroundTransparency = alpha
+        TS:Create(eyeBlurLeft, TweenInfo.new(6), {BackgroundTransparency = 1}):Play()
+    else
+        eyeBlurRight.BackgroundTransparency = alpha
+        TS:Create(eyeBlurRight, TweenInfo.new(6), {BackgroundTransparency = 1}):Play()
+    end
+end
+
+function FX.deathFlashback()
+    if not (S.ScreenFX and S.DeathFlashbacks) then return end
+    local colors = {
+        Color3.new(1, 1, 1), Color3.new(0, 0, 0), Color3.fromRGB(200, 8, 8),
+        Color3.new(1, 1, 1), Color3.new(0, 0, 0), Color3.fromRGB(160, 0, 0),
+        Color3.new(0, 0, 0),
+    }
+    task.spawn(function()
+        for _, c in ipairs(colors) do
+            local f = new("Frame", {
+                Size = UDim2.fromScale(1, 1), BackgroundColor3 = c, BackgroundTransparency = 0,
+                BorderSizePixel = 0, ZIndex = 22,
+            }, flashbackLayer)
+            task.wait(0.045)
+            TS:Create(f, TweenInfo.new(0.12), {BackgroundTransparency = 1}):Play()
+            Debris:AddItem(f, 0.2)
+            task.wait(0.04)
+        end
+    end)
+end
+
+function FX.activateLensDrops(count)
+    if not (S.ScreenFX and S.LensTilt) then return end
+    count = count or rng:NextInteger(3, 7)
+    local activated = 0
+    for _, d in ipairs(lensDrops) do
+        if not d.active and activated < count then
+            d.active = true
+            d.posY = rnd(0, 0.6)
+            d.posX = rnd(0.05, 0.95)
+            d.frame.BackgroundTransparency = rnd(0.2, 0.45)
+            d.frame.Position = UDim2.fromScale(d.posX, d.posY)
+            d.frame.Size = UDim2.fromOffset(rng:NextInteger(4, 10), rng:NextInteger(18, 45))
+            activated = activated + 1
+        end
+    end
+    FX_V11.lensDropsActive = true
+    task.delay(12, function()
+        for _, d in ipairs(lensDrops) do
+            if d.active then
+                TS:Create(d.frame, TweenInfo.new(2), {BackgroundTransparency = 1}):Play()
+                task.delay(2.1, function() d.active = false end)
+            end
+        end
+        FX_V11.lensDropsActive = false
+    end)
+end
+
+function FX.adrenaline()
+    numTween(Post.fov, -18, 0.35)
+    numTween(Post.sat, 0.7, 0.35)
+    numTween(Post.blurT, 5, 0.35)
+    task.delay(1.8, function()
+        numTween(Post.fov, 0, 1.2)
+        numTween(Post.sat, 0, 1.2)
+        numTween(Post.blurT, 0, 1.2)
+    end)
+end
+
+local function thump(vol)
+    local s = Audio.ui(HEARTBEAT_THUMP, vol, 0.3)
+    if s then TS:Create(s, TweenInfo.new(0.4), {Volume = 0}):Play() end
+end
+
+function FX.update(dt, hp, dead)
+    local low = dead and 0 or clamp((0.4 - hp) / 0.4, 0, 1)
+    if low > 0 and S.ScreenFX then
+        local bpm = 70 + low * 95
+        FX.hbPhase = FX.hbPhase + dt * bpm / 60
+        if FX.hbPhase >= 1 then
+            FX.hbPhase = FX.hbPhase - 1
+            FX.beat1, FX.beat2 = false, false
+        end
+        if not FX.beat1 then
+            FX.beat1 = true
+            FX.hbEnv = 1
+            if S.HeartbeatSFX then thump((0.3 + low * 0.5) * S.HeartbeatVolume) end
+        end
+        if not FX.beat2 and FX.hbPhase >= 0.28 then
+            FX.beat2 = true
+            FX.hbEnv = 0.7
+            if S.HeartbeatSFX then thump((0.2 + low * 0.4) * S.HeartbeatVolume) end
+        end
+    end
+    FX.hbEnv = FX.hbEnv * math.exp(-8 * dt)
+
+    local vig = S.VignetteIntensity
+    if S.ScreenFX and S.Vignette then
+        local deadA = dead and 0.55 or 0
+        vigDark.set(clamp((low * (0.55 + 0.2 * FX.hbEnv) + FX.impulse.Value * 0.45 + deadA) * vig, 0, 1))
+        vigBlood.set(clamp((FX.edge * 0.55 + low * (0.25 + 0.25 * FX.hbEnv) + FX.impulse.Value * 0.35) * vig, 0, 1))
+    else
+        vigDark.set(0)
+        vigBlood.set(0)
+    end
+    Post.update(hp, dead)
+
+    if S.ScreenFX and S.BreathingVignette and low > 0.1 then
+        local pulse = FX.hbEnv * 0.04 * low
+        local sc = 1 + pulse
+        vigDark.set(clamp((low * (0.55 + 0.25 * FX.hbEnv) + FX.impulse.Value * 0.45 + (dead and 0.55 or 0)) * S.VignetteIntensity, 0, 1))
+    end
+
+    if S.ScreenFX and S.HypoxicTunnel then
+        local tunnelT = clamp((0.20 - hp) / 0.20, 0, 1)
+        if tunnelT > 0 then
+            local borderAlpha = clamp(tunnelT * 0.9, 0, 1)
+            tunnelBorder.BackgroundTransparency = 1 - borderAlpha * 0.85
+            Post.dof.FarIntensity = math.max(Post.dof.FarIntensity, tunnelT * 0.6)
+            Post.dof.NearIntensity = math.max(Post.dof.NearIntensity or 0, tunnelT * 0.3)
+        else
+            tunnelBorder.BackgroundTransparency = 1
+        end
+    end
+
+    if S.ScreenFX and S.FilmGrain then
+        local grainT = clamp((0.40 - hp) / 0.40, 0, 1)
+        FX_V11.grainIntensity = grainT
+    end
+
+    if S.ScreenFX and S.ChromAberration and low > 0.15 then
+        local continuousChrom = low * 0.12
+        chromR.BackgroundTransparency = 1 - continuousChrom
+        chromG.BackgroundTransparency = 1 - continuousChrom * 0.4
+        chromB.BackgroundTransparency = 1 - continuousChrom
+        local s = continuousChrom * 0.002
+        chromR.Position = UDim2.fromScale(-s, -s * 0.5)
+        chromB.Position = UDim2.fromScale(s, s * 0.5)
+    elseif FX_V11.chromIntensity <= 0 then
+        chromR.BackgroundTransparency = 1
+        chromG.BackgroundTransparency = 1
+        chromB.BackgroundTransparency = 1
+    end
+end
+
+local Blood = {}
+local DropList, DropPool = {}, {}
+local SplatGroups = {}
+
+local baseRay = RaycastParams.new()
+baseRay.FilterType = Enum.RaycastFilterType.Exclude
+baseRay.FilterDescendantsInstances = {BloodFolder}
+baseRay.RespectCanCollide = true
+
+local function flatPart(props)
+    props.Anchored = true
+    props.CanCollide = false
+    props.CanQuery = false
+    props.CanTouch = false
+    props.CastShadow = false
+    props.Material = props.Material or Enum.Material.SmoothPlastic
+    return new("Part", props)
+end
+
+local function alignedCF(pos, normal, forward)
+    local f = forward - normal * forward:Dot(normal)
+    if f.Magnitude < 0.05 then return surfaceCF(pos, normal, rnd(0, math.pi * 2)) end
+    f = f.Unit
+    return CFrame.fromMatrix(pos, f:Cross(normal), normal)
+end
+
+local function getDropPart()
+    local p = table.remove(DropPool)
+    if p then return p end
+    return flatPart({
+        Name = "Drop", Color = WET_BLOOD, Reflectance = 0.25, Size = Vector3.new(0.1, 0.1, 0.25),
+    })
+end
+
+local function releaseDrop(p)
+    p.Parent = nil
+    if #DropPool < 220 then table.insert(DropPool, p) else p:Destroy() end
+end
+
+local function fadeGroupLater(group, life)
+    task.delay(life, function()
+        for _, p in ipairs(group.parts) do
+            if p.Parent then
+                TS:Create(p, TweenInfo.new(4), {Transparency = 1}):Play()
+                Debris:AddItem(p, 4.2)
+            end
+        end
+    end)
+end
+
+local function registerGroup(group, life)
+    table.insert(SplatGroups, group)
+    while #SplatGroups > S.MaxSplats do
+        local old = table.remove(SplatGroups, 1)
+        for _, p in ipairs(old.parts) do p:Destroy() end
+    end
+    fadeGroupLater(group, life)
+end
+
+function Blood.wallDrip(pos, normal, size)
+    local len = rnd(0.8, 2.8)
+    local w = rnd(0.08, 0.16)
+    local right = normal:Cross(Vector3.yAxis)
+    if right.Magnitude < 0.05 then return end
+    right = right.Unit
+    local start = pos + normal * 0.02
+    local p = flatPart({
+        Name = "BloodDrip", Size = Vector3.new(w, 0.12, 0.02), Color = WET_BLOOD, Reflectance = 0.12,
+        CFrame = CFrame.fromMatrix(start - Vector3.yAxis * 0.06, right, Vector3.yAxis),
+    })
+    p.Parent = BloodFolder
+    TS:Create(p, TweenInfo.new(rnd(4, 9), Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Size = Vector3.new(w, len, 0.02),
+        CFrame = CFrame.fromMatrix(start - Vector3.yAxis * (len / 2), right, Vector3.yAxis),
+    }):Play()
+    TS:Create(p, TweenInfo.new(30), {Color = DRY_BLOOD, Reflectance = 0.02}):Play()
+    local group = {parts = {p}}
+    registerGroup(group, S.BloodLifetime)
+end
+
+function Blood.splat(pos, normal, size, vel, dmg)
+    local group = {parts = {}}
+    local function add(p)
+        table.insert(group.parts, p)
+        p.Parent = BloodFolder
+    end
+
+    local tangent = vel - normal * vel:Dot(normal)
+    local tl = tangent.Magnitude
+    local tdir = tl > 0.1 and tangent.Unit or nil
+    local function disc(offset, d)
+        local p = flatPart({
+            Name = "BloodDisc", Shape = Enum.PartType.Cylinder,
+            Size = Vector3.new(0.02 + rnd(0, 0.01), d, d * rnd(0.85, 1.15)),
+            Color = WET_BLOOD, Reflectance = 0.14,
+            CFrame = surfaceCF(pos + normal * (0.016 + rnd(0, 0.01)) + offset, normal, rnd(0, math.pi)) * CFrame.Angles(0, 0, math.pi / 2),
+        })
+        add(p)
+        TS:Create(p, TweenInfo.new(30, Enum.EasingStyle.Quad), {Color = DRY_BLOOD, Reflectance = 0.02}):Play()
+    end
+    local main = size * 0.5 * rnd(0.8, 1.1)
+    disc(Vector3.zero, main)
+    if tdir then
+        for k = 1, clamp(math.floor(tl / 12), 1, 4) do
+            disc(tdir * (k * main * 0.55), main * (1 - k * 0.2))
+        end
+    end
+    for _ = 1, rng:NextInteger(2, 4) do
+        local rv = randDir()
+        rv = rv - normal * rv:Dot(normal)
+        if rv.Magnitude > 0.05 then
+            rv = rv.Unit
+            if tdir and rv:Dot(tdir) < 0 then rv = -rv end
+            disc(rv * rnd(0.6, 1.6) * main, main * rnd(0.08, 0.25))
+        end
+    end
+
+    registerGroup(group, S.BloodLifetime)
+
+    if S.WallDrips and math.abs(normal.Y) < 0.35 and size > 2.4 and rng:NextNumber() < 0.6 then
+        Blood.wallDrip(pos, normal, size)
+    end
+end
+
+local recentPools = {}
+local POOL_COOLDOWN = 2.0
+local POOL_MIN_DIST = 4.0
+
+function Blood.pool(pos, size, grow)
+    local now = os.clock()
+    for i = #recentPools, 1, -1 do
+        if now - recentPools[i].t > POOL_COOLDOWN then
+            table.remove(recentPools, i)
+        end
+    end
+    for _, p in ipairs(recentPools) do
+        if (p.pos - pos).Magnitude < POOL_MIN_DIST then
+            return
+        end
+    end
+    table.insert(recentPools, {pos = pos, t = now})
+    if #recentPools > 24 then table.remove(recentPools, 1) end
+
+    local res = raycastVisible(pos + Vector3.new(0, 1, 0), Vector3.new(0, -30, 0), baseRay)
+    if not res then return end
+    if res.Material == Enum.Material.Water then
+        if S.WaterBlood then
+            local att = new("Attachment", nil, workspace.Terrain)
+            att.WorldPosition = res.Position + Vector3.new(0, 0.08, 0)
+            new("ParticleEmitter", {
+                Name = "WaterBloodCloud", Texture = MIST_TEX,
+                Color = ColorSequence.new(WET_BLOOD),
+                Size = NumberSequence.new({NumberSequenceKeypoint.new(0, size or 2), NumberSequenceKeypoint.new(1, (size or 2) * 2.2)}),
+                Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 1)}),
+                Lifetime = NumberRange.new(2, 4), Speed = NumberRange.new(0.15, 0.8),
+                SpreadAngle = Vector2.new(180, 180), Drag = 1.5, Rate = 0, LightEmission = 0,
+            }, att):Emit(12)
+            Debris:AddItem(att, 4.5)
+        end
+        return
+    end
+    size = (size or 3) * S.BloodPoolSize
+    local group = {parts = {}}
+    for i = 1, rng:NextInteger(2, 4) do
+        local off = Vector3.zero
+        if i > 1 then
+            local rv = randDir()
+            rv = Vector3.new(rv.X, 0, rv.Z)
+            if rv.Magnitude < 0.05 then rv = Vector3.xAxis end
+            off = rv.Unit * rnd(0.1, 0.35) * size
+        end
+        local final = size * (i == 1 and 1 or rnd(0.45, 0.8))
+        local p = flatPart({
+            Name = "BloodPool", Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.025, 0.1, 0.1),
+            Color = WET_BLOOD, Reflectance = 0.18,
+            CFrame = surfaceCF(res.Position + res.Normal * (0.02 + 0.004 * i) + off, res.Normal, rnd(0, math.pi)) * CFrame.Angles(0, 0, math.pi / 2),
+        })
+        p.Parent = BloodFolder
+        TS:Create(p, TweenInfo.new(grow or 12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Size = Vector3.new(0.025, final, final * rnd(0.85, 1.1)),
+        }):Play()
+        TS:Create(p, TweenInfo.new(45), {Color = DRY_BLOOD, Reflectance = 0.03}):Play()
+        table.insert(group.parts, p)
+    end
+    registerGroup(group, S.BloodLifetime + 10)
+    if #group.parts > 0 then
+        local mainPool = group.parts[1]
+        Blood.addPoolSkin(mainPool)
+        Blood.attractInsects(mainPool)
+        Blood.registerPoolForMerge(mainPool)
+    end
+    if S.FlyEffects then
+        local att = new("Attachment", nil, workspace.Terrain)
+        att.WorldPosition = res.Position + Vector3.new(0, 0.15, 0)
+        new("ParticleEmitter", {
+            Name = "BloodFlyMotes", Texture = MIST_TEX,
+            Color = ColorSequence.new(Color3.fromRGB(24, 18, 16)),
+            Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.035), NumberSequenceKeypoint.new(1, 0.015)}),
+            Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.15), NumberSequenceKeypoint.new(1, 1)}),
+            Lifetime = NumberRange.new(0.8, 1.6), Speed = NumberRange.new(0.3, 1.1),
+            SpreadAngle = Vector2.new(180, 180), Acceleration = Vector3.new(0, 0.3, 0),
+            Rate = 3, RotSpeed = NumberRange.new(-90, 90), LightEmission = 0,
+        }, att)
+        Debris:AddItem(att, math.min(S.BloodLifetime, 25))
+    end
+end
+
+function Blood.footprint(pos, forward, alpha)
+    if S.ArchedFootprint then
+        Blood.archedFootprint(pos, forward, alpha)
+        return
+    end
+    local res = raycastVisible(pos + Vector3.new(0, 1.5, 0), Vector3.new(0, -5, 0), baseRay)
+    if not res then return end
+    local p = flatPart({
+        Name = "Footprint", Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.02, 0.45, 0.8),
+        Color = Color3.fromRGB(105, 5, 8), Reflectance = 0.06,
+        Transparency = clamp(1 - alpha, 0.08, 0.92),
+        CFrame = alignedCF(res.Position + res.Normal * 0.02, res.Normal, forward) * CFrame.Angles(0, 0, math.pi / 2),
+    })
+    p.Parent = BloodFolder
+    TS:Create(p, TweenInfo.new(20), {Transparency = 1}):Play()
+    Debris:AddItem(p, 20.5)
+end
+
+function Blood.mist(pos, scale)
+    if not S.BloodMistEnabled then return end
+    local a = new("Attachment", nil, workspace.Terrain)
+    a.WorldPosition = pos
+    local em = new("ParticleEmitter", {
+        Color = ColorSequence.new(Color3.fromRGB(95, 0, 0)),
+        Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.4 * scale), NumberSequenceKeypoint.new(1, 2.6 * scale)}),
+        Texture = MIST_TEX,
+        Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 1)}),
+        Lifetime = NumberRange.new(0.5, 1.2), Speed = NumberRange.new(3 * scale, 9 * scale),
+        SpreadAngle = Vector2.new(180, 180), Drag = 2, Rate = 0, LightEmission = 0,
+        Rotation = NumberRange.new(0, 360), RotSpeed = NumberRange.new(-60, 60),
+        Acceleration = Vector3.new(0, -4, 0),
+    }, a)
+    em:Emit(math.max(2, math.floor(18 * scale * OPT())))
+    Debris:AddItem(a, 2.4)
+end
+
+function Blood.droplets(pos, dir, scale)
+    local a = new("Attachment", nil, workspace.Terrain)
+    a.WorldCFrame = CFrame.lookAt(pos, pos + dir)
+    local em = new("ParticleEmitter", {
+        Color = ColorSequence.new(Color3.fromRGB(120, 4, 6)), Texture = DROP_TEX,
+        Orientation = Enum.ParticleOrientation.VelocityParallel,
+        EmissionDirection = Enum.NormalId.Front,
+        Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.3 * scale), NumberSequenceKeypoint.new(1, 0.12 * scale)}),
+        Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.05), NumberSequenceKeypoint.new(1, 0.6)}),
+        Lifetime = NumberRange.new(0.3, 0.7), Speed = NumberRange.new(14, 34),
+        SpreadAngle = Vector2.new(28, 28), Acceleration = Vector3.new(0, -90, 0), Rate = 0, LightEmission = 0,
+    }, a)
+    em:Emit(math.max(3, math.floor(14 * scale * OPT())))
+    Debris:AddItem(a, 1.5)
+end
+
+function Blood.spray(origin, dir, count, vmin, vmax, spread, dmg, ignore)
+    count = math.max(1, math.floor(count * OPT()))
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.RespectCanCollide = true
+    rp.FilterDescendantsInstances = ignore and {BloodFolder, ignore} or {BloodFolder}
+    for _ = 1, count do
+        if #DropList >= 90 + 90 * S.Quality then break end
+        local v
+        if dir and dir.Magnitude > 0.01 then
+            v = dir.Unit + Vector3.new(rnd(-1, 1), rnd(-1, 1), rnd(-1, 1)) * (spread or 0.5)
+            v = v.Magnitude > 0.05 and v.Unit or dir.Unit
+        else
+            v = Vector3.new(rnd(-1, 1), rnd(0.2, 1.6), rnd(-1, 1)).Unit
+        end
+        local part = getDropPart()
+        local sz = rnd(0.07, 0.16)
+        part.Size = Vector3.new(sz, sz, sz * 2.4)
+        part.CFrame = CFrame.lookAt(origin, origin + v)
+        part.Parent = BloodFolder
+        table.insert(DropList, {
+            pos = origin, vel = v * rnd(vmin or 14, vmax or 38), part = part, age = 0, params = rp,
+            size = rnd(1.4, 4.5) * (1 + (dmg or 0) / 70), dmg = dmg or 8,
+        })
+    end
+end
+
+local stainCharacterPart
+
+local lastImpactSound = 0
+RunService.Heartbeat:Connect(function(dt)
+    dt = math.min(dt, 1 / 20)
+    local g = Vector3.new(0, -workspace.Gravity * 0.55 * dt, 0)
+    local i = #DropList
+    while i >= 1 do
+        local d = DropList[i]
+        local remove = false
+        d.vel = d.vel + g
+        d.age = d.age + dt
+        local step = d.vel * dt
+        local res = raycastVisible(d.pos, step, d.params)
+        if res then
+            remove = true
+            local inst = res.Instance
+            local model = inst:FindFirstAncestorOfClass("Model")
+            if model and model:FindFirstChildOfClass("Humanoid") then
+                if stainCharacterPart then stainCharacterPart(inst, 1) end
+            else
+                Blood.splat(res.Position, res.Normal, d.size, d.vel, d.dmg)
+                local now = os.clock()
+                if now - lastImpactSound > 0.06 and rng:NextNumber() < 0.4 then
+                    lastImpactSound = now
+                    Audio.impact(res.Position, d.dmg > 20)
+                end
+            end
+        elseif d.age > 4 then
+            remove = true
+        else
+            d.pos = d.pos + step
+            if d.vel.Magnitude > 0.1 then
+                d.part.CFrame = CFrame.lookAt(d.pos, d.pos + d.vel)
+            end
+        end
+        if remove then
+            releaseDrop(d.part)
+            DropList[i] = DropList[#DropList]
+            DropList[#DropList] = nil
+        end
+        i = i - 1
+    end
+end)
+
+function Blood.arterial(part, duration, ignore)
+    if not S.ArterialSpray or not part then return end
+    task.spawn(function()
+        local t = 0
+        while t < duration and part and part.Parent do
+            local fade = 1 - t / duration
+            local dir = (part.CFrame.UpVector + Vector3.new(rnd(-0.4, 0.4), rnd(0, 0.5), rnd(-0.4, 0.4)))
+            local o = part.Position
+            Blood.droplets(o, dir, 0.8 + fade)
+            Blood.spray(o, dir, 7 + 8 * fade, 14, 26 + 10 * fade, 0.3, 24, ignore)
+            if rng:NextNumber() < 0.5 then Audio.at(o, bleedingSounds, 0.5, 0.9, 1.1, 60) end
+            if S.BleedVapor and rng:NextNumber() < 0.6 then Blood.bleedVapor(o) end
+            local w = 0.32 + 0.25 * (1 - fade)
+            task.wait(w)
+            t = t + w
+        end
+    end)
+end
+
+function Blood.wallSpatter(origin, count)
+    if not S.WallSpatterEnabled then return end
+    count = math.max(1, math.floor(count * OPT()))
+    for _ = 1, count do
+        local res = raycastVisible(origin, randDir() * 14, baseRay)
+        if res then
+            Blood.splat(res.Position, res.Normal, rnd(2.2, 5.5), Vector3.zero, 15)
+        end
+    end
+end
+
+local ChunkDefs = {
+    meat = {shape = Enum.PartType.Ball, size = Vector3.new(0.5, 0.5, 0.5), color = Color3.fromRGB(140, 20, 25), trail = true, snd = fleshSounds},
+    bone = {shape = Enum.PartType.Cylinder, size = Vector3.new(0.6, 0.15, 0.15), color = Color3.fromRGB(235, 225, 205), trail = false, snd = boneBreakSounds},
+    tooth = {shape = Enum.PartType.Block, size = Vector3.new(0.15, 0.2, 0.15), color = Color3.fromRGB(250, 248, 240), trail = false},
+    skin = {shape = Enum.PartType.Block, size = Vector3.new(0.45, 0.45, 0.06), color = Color3.fromRGB(220, 180, 160), trail = true},
+}
+
+function Blood.chunk(kind, pos, dir, scale)
+    if not S.Debris then return end
+    if rng:NextNumber() > clamp(S.ChunkCount, 0, 1) then return end
+    local def = ChunkDefs[kind]
+    scale = scale or 1
+    dir = dir or randDir()
+    local p = new("Part", {
+        Name = "Chunk_" .. kind, Shape = def.shape, Size = def.size * scale, Color = def.color,
+        Material = Enum.Material.SmoothPlastic, CanCollide = true, CFrame = CFrame.new(pos) * CFrame.Angles(rnd(-3, 3), rnd(-3, 3), rnd(-3, 3)),
+    })
+    if def.trail then
+        p.Material = Enum.Material.Slate
+        local em = new("ParticleEmitter", {
+            Color = ColorSequence.new(Color3.fromRGB(120, 4, 6)), Texture = DROP_TEX,
+            Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.22), NumberSequenceKeypoint.new(1, 0.04)}),
+            Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(1, 1)}),
+            Lifetime = NumberRange.new(0.4, 0.8), Speed = NumberRange.new(0, 1), Rate = 28,
+            Acceleration = Vector3.new(0, -30, 0), LockedToPart = false, LightEmission = 0,
+        }, p)
+        task.delay(2.2, function() if em.Parent then em.Enabled = false end end)
+    end
+    p.Parent = BloodFolder
+    local cf = S.ChunkForce
+    p.AssemblyLinearVelocity = dir.Unit * rnd(12, 30) * cf + Vector3.new(0, rnd(8, 20) * cf, 0)
+    p.AssemblyAngularVelocity = Vector3.new(rnd(-25, 25), rnd(-25, 25), rnd(-25, 25))
+    local hit = false
+    local conn
+    conn = p.Touched:Connect(function(o)
+        if hit or o:IsDescendantOf(BloodFolder) then return end
+        if o.Parent and o.Parent:FindFirstChildOfClass("Humanoid") then return end
+        hit = true
+        conn:Disconnect()
+        Blood.spray(p.Position, Vector3.yAxis, 4, 4, 12, 0.9, 10)
+        if def.snd then Audio.at(p.Position, def.snd, 0.5, 0.8, 1.2, 60) end
+    end)
+    Debris:AddItem(p, S.ChunkLifetime)
+    return p
+end
+
+local BODY_PARTS = {
+    "Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg", "UpperTorso", "LowerTorso",
+    "LeftUpperArm", "LeftLowerArm", "RightUpperArm", "RightLowerArm",
+    "LeftUpperLeg", "LeftLowerLeg", "RightUpperLeg", "RightLowerLeg",
+}
+local STAIN_FACES = {
+    Front  = {normal = Vector3.new(0, 0, -1), axis = "Z"},
+    Back   = {normal = Vector3.new(0, 0, 1),  axis = "Z"},
+    Left   = {normal = Vector3.new(-1, 0, 0), axis = "X"},
+    Right  = {normal = Vector3.new(1, 0, 0),  axis = "X"},
+    Top    = {normal = Vector3.new(0, 1, 0),  axis = "Y"},
+    Bottom = {normal = Vector3.new(0, -1, 0), axis = "Y"},
+}
+local STAIN_KEYS = {"Front", "Back", "Left", "Right", "Top", "Bottom"}
+
+stainCharacterPart = function(part, amount)
+    if not S.BodyBlood or not part or not part:IsA("BasePart") then return end
+    local n = 0
+    for _, c in ipairs(part:GetChildren()) do
+        if c.Name == "BloodStain" then n = n + 1 end
+    end
+    if n >= 4 then return end
+
+    local key = STAIN_KEYS[rng:NextInteger(1, #STAIN_KEYS)]
+    local fdef = STAIN_FACES[key]
+    local normal = fdef.normal
+    local sz = part.Size
+    local faceSize
+    if fdef.axis == "X" then faceSize = math.min(sz.Y, sz.Z)
+    elseif fdef.axis == "Y" then faceSize = math.min(sz.X, sz.Z)
+    else faceSize = math.min(sz.X, sz.Y) end
+    local discSize = faceSize * rnd(0.35, 0.65)
+
+    local halfSize = Vector3.new(sz.X, sz.Y, sz.Z) * 0.5
+    local offset = Vector3.new(
+        normal.X ~= 0 and normal.X * (halfSize.X + 0.006) or rnd(-halfSize.X * 0.5, halfSize.X * 0.5),
+        normal.Y ~= 0 and normal.Y * (halfSize.Y + 0.006) or rnd(-halfSize.Y * 0.5, halfSize.Y * 0.5),
+        normal.Z ~= 0 and normal.Z * (halfSize.Z + 0.006) or rnd(-halfSize.Z * 0.5, halfSize.Z * 0.5)
+    )
+    local worldCF = part.CFrame * CFrame.new(offset)
+    local baseCF = surfaceCF(worldCF.Position, (part.CFrame - part.CFrame.Position) * normal, rnd(0, math.pi * 2))
+
+    local p = new("Part", {
+        Name = "BloodStain", Shape = Enum.PartType.Cylinder,
+        Size = Vector3.new(0.015, discSize, discSize * rnd(0.8, 1.2)),
+        Color = WET_BLOOD, Material = Enum.Material.SmoothPlastic, Reflectance = 0.12,
+        CanCollide = false, CanQuery = false, CanTouch = false, Massless = true, CastShadow = false,
+        Transparency = clamp(0.55 - amount * 0.35, 0.1, 0.6),
+        CFrame = baseCF * CFrame.Angles(0, 0, math.pi / 2),
+    })
+    new("WeldConstraint", {Part0 = part, Part1 = p}, p)
+    p.Parent = part
+
+    TS:Create(p, TweenInfo.new(25), {Color = DRY_BLOOD}):Play()
+    task.delay(S.BloodLifetime, function()
+        if p.Parent then
+            TS:Create(p, TweenInfo.new(3), {Transparency = 1}):Play()
+            Debris:AddItem(p, 3.1)
+        end
+    end)
+end
+
+function Blood.bodyBlood(char, damage)
+    local chance = clamp(damage / 40, 0.2, 0.85) * S.BodyBloodAmount
+    for _, name in ipairs(BODY_PARTS) do
+        local part = char:FindFirstChild(name)
+        if part and part:IsA("BasePart") and rng:NextNumber() < chance then
+            stainCharacterPart(part, damage / 40)
+        end
+    end
+end
+
+function Blood.viscositySplat(pos, normal, woundType)
+    if not S.ViscosityBlood then return end
+    woundType = woundType or "cut"
+    local group = {parts = {}}
+    local function add(p) table.insert(group.parts, p); p.Parent = BloodFolder end
+    if woundType == "arterial" then
+        for _ = 1, rng:NextInteger(6, 12) do
+            local d = rnd(0.15, 0.45)
+            local p = flatPart({
+                Name = "ViscDrop", Shape = Enum.PartType.Cylinder,
+                Size = Vector3.new(0.02, d * 0.5, d),
+                Color = WET_BLOOD, Reflectance = 0.2,
+                CFrame = surfaceCF(pos + normal * 0.015 + Vector3.new(rnd(-0.8, 0.8), 0, rnd(-0.8, 0.8)), normal, rnd(0, math.pi)) * CFrame.Angles(0, 0, math.pi/2),
+            })
+            add(p)
+        end
+    elseif woundType == "contusion" then
+        local d = rnd(1.2, 2.8)
+        local p = flatPart({
+            Name = "ViscContusion", Shape = Enum.PartType.Cylinder,
+            Size = Vector3.new(0.025, d, d * rnd(0.88, 1.12)),
+            Color = Color3.fromRGB(42, 3, 3), Reflectance = 0.05,
+            CFrame = surfaceCF(pos + normal * 0.015, normal, rnd(0, math.pi)) * CFrame.Angles(0, 0, math.pi/2),
+            Transparency = 0.25,
+        })
+        add(p)
+        TS:Create(p, TweenInfo.new(20, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Size = Vector3.new(0.025, d * 2.2, d * 2.2 * rnd(0.85, 1.1)),
+        }):Play()
+    elseif woundType == "lung" then
+        Blood.lungFoam(pos)
+    end
+    registerGroup(group, S.BloodLifetime)
+end
+
+function Blood.lungFoam(pos)
+    if not S.LungFoam then return end
+    local att = new("Attachment", nil, workspace.Terrain)
+    att.WorldPosition = pos
+    local foam = new("ParticleEmitter", {
+        Color = ColorSequence.new(Color3.fromRGB(230, 160, 165), Color3.fromRGB(200, 100, 110)),
+        Texture = MIST_TEX,
+        Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.18), NumberSequenceKeypoint.new(1, 0.55)}),
+        Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.25), NumberSequenceKeypoint.new(1, 1)}),
+        Lifetime = NumberRange.new(1.2, 2.4), Speed = NumberRange.new(0.4, 1.8),
+        SpreadAngle = Vector2.new(60, 60), Acceleration = Vector3.new(0, 1.5, 0),
+        Rate = 0, LightEmission = 0,
+    }, att)
+    foam:Emit(math.floor(8 * OPT()))
+    local drops = new("ParticleEmitter", {
+        Color = ColorSequence.new(Color3.fromRGB(180, 20, 25)),
+        Texture = DROP_TEX,
+        Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.08), NumberSequenceKeypoint.new(1, 0.03)}),
+        Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(1, 0.9)}),
+        Lifetime = NumberRange.new(0.6, 1.2), Speed = NumberRange.new(0.5, 2),
+        SpreadAngle = Vector2.new(90, 90), Rate = 0, LightEmission = 0,
+    }, att)
+    drops:Emit(math.floor(5 * OPT()))
+    Debris:AddItem(att, 2.5)
+end
+
+function Blood.ceilingDrip(ceilingPos)
+    if not S.CeilingBloodDrip then return end
+    task.spawn(function()
+        for _ = 1, rng:NextInteger(2, 5) do
+            task.wait(rnd(0.3, 1.5))
+            local dropPos = ceilingPos + Vector3.new(rnd(-2, 2), 0, rnd(-2, 2))
+            local a = new("Attachment", nil, workspace.Terrain)
+            a.WorldPosition = dropPos
+            local em = new("ParticleEmitter", {
+                Color = ColorSequence.new(WET_BLOOD), Texture = DROP_TEX,
+                Orientation = Enum.ParticleOrientation.VelocityParallel,
+                EmissionDirection = Enum.NormalId.Bottom,
+                Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.15), NumberSequenceKeypoint.new(1, 0.06)}),
+                Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.05), NumberSequenceKeypoint.new(1, 0.5)}),
+                Lifetime = NumberRange.new(1.5, 3), Speed = NumberRange.new(3, 8),
+                SpreadAngle = Vector2.new(5, 5), Acceleration = Vector3.new(0, -workspace.Gravity, 0),
+                Rate = 0, LightEmission = 0,
+            }, a)
+            em:Emit(rng:NextInteger(2, 5))
+            Debris:AddItem(a, 3.5)
+        end
+    end)
+end
+
+function Blood.bleedVapor(pos)
+    if not S.BleedVapor then return end
+    local a = new("Attachment", nil, workspace.Terrain)
+    a.WorldPosition = pos
+    local em = new("ParticleEmitter", {
+        Color = ColorSequence.new(Color3.fromRGB(210, 180, 180), Color3.fromRGB(180, 150, 150)),
+        Texture = MIST_TEX,
+        Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.06), NumberSequenceKeypoint.new(1, 0.35)}),
+        Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(1, 1)}),
+        Lifetime = NumberRange.new(0.4, 0.8), Speed = NumberRange.new(0.3, 1.2),
+        SpreadAngle = Vector2.new(40, 40), Acceleration = Vector3.new(0, 2, 0),
+        Rate = 0, LightEmission = 0,
+    }, a)
+    em:Emit(rng:NextInteger(3, 7))
+    Debris:AddItem(a, 1.2)
+end
+
+function Blood.bodyPartSmear(partPos, normal)
+    if not S.WallSmear then return end
+    local res = raycastVisible(partPos, normal * 2.5, baseRay)
+    if not res then return end
+    local w = rnd(0.12, 0.28)
+    local len = rnd(0.3, 1.2)
+    local right = res.Normal:Cross(Vector3.yAxis)
+    if right.Magnitude < 0.05 then return end
+    right = right.Unit
+    local p = flatPart({
+        Name = "BodySmear", Size = Vector3.new(w, len, 0.015),
+        Color = WET_BLOOD, Reflectance = 0.08,
+        CFrame = CFrame.fromMatrix(res.Position + res.Normal * 0.012, right, Vector3.yAxis),
+        Transparency = 0.2,
+    })
+    p.Parent = BloodFolder
+    TS:Create(p, TweenInfo.new(20), {Color = DRY_BLOOD, Reflectance = 0.02}):Play()
+    local group = {parts = {p}}
+    registerGroup(group, S.BloodLifetime)
+end
+
+function Blood.archedFootprint(pos, forward, alpha)
+    if not S.ArchedFootprint then return end
+    local right = forward:Cross(Vector3.yAxis)
+    if right.Magnitude < 0.05 then right = Vector3.xAxis else right = right.Unit end
+    local heelPos = pos - forward * 0.2
+    local toePos = pos + forward * 0.2
+    for _, fp in ipairs({heelPos, toePos}) do
+        local res = raycastVisible(fp + Vector3.new(0, 1, 0), Vector3.new(0, -4, 0), baseRay)
+        if res then
+            local p = flatPart({
+                Name = "ArchedFootprint", Shape = Enum.PartType.Cylinder,
+                Size = Vector3.new(0.02, 0.22, 0.32),
+                Color = Color3.fromRGB(105, 5, 8), Reflectance = 0.04,
+                Transparency = clamp(1 - alpha, 0.1, 0.92),
+                CFrame = alignedCF(res.Position + res.Normal * 0.02, res.Normal, forward) * CFrame.Angles(0, 0, math.pi/2),
+            })
+            p.Parent = BloodFolder
+            TS:Create(p, TweenInfo.new(18), {Transparency = 1}):Play()
+            Debris:AddItem(p, 18.5)
+        end
+    end
+end
+
+local function isRaining()
+    local atm = Lighting:FindFirstChildOfClass("Atmosphere")
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("ParticleEmitter") and (d.Name:lower():find("rain") or d.Name:lower():find("water")) then
+            return true
+        end
+    end
+    return false
+end
+
+function Blood.addPoolSkin(poolPart)
+    if not S.PoolSkin then return end
+    if poolPart:FindFirstChild("PoolSkin") then return end
+    task.delay(8, function()
+        if not poolPart.Parent then return end
+        local sz = poolPart.Size
+        if math.max(sz.Y, sz.Z) < 4 then return end
+        local skin = new("Part", {
+            Name = "PoolSkin",
+            Shape = Enum.PartType.Cylinder,
+            Size = Vector3.new(0.018, sz.Y * 1.02, sz.Z * 1.02),
+            Color = Color3.fromRGB(35, 2, 2),
+            Material = Enum.Material.SmoothPlastic, Reflectance = 0.04,
+            CanCollide = false, CanQuery = false, CanTouch = false,
+            Massless = true, CastShadow = false,
+            Transparency = 0.35,
+        })
+        local wc = new("WeldConstraint", {Part0 = poolPart, Part1 = skin}, skin)
+        skin.CFrame = poolPart.CFrame
+        skin.Parent = poolPart
+        task.spawn(function()
+            while skin.Parent and poolPart.Parent do
+                task.wait(rnd(4, 9))
+                if skin.Parent then
+                    TS:Create(skin, TweenInfo.new(3), {
+                        Size = Vector3.new(0.018, sz.Y * rnd(0.98, 1.02), sz.Z * rnd(0.98, 1.02)),
+                    }):Play()
+                end
+            end
+        end)
+    end)
+end
+
+function Blood.attractInsects(poolPart)
+    if not S.InsectAttract then return end
+    task.delay(30, function()
+        if not poolPart.Parent then return end
+        local pos = poolPart.Position
+        local att = new("Attachment", nil, workspace.Terrain)
+        att.WorldPosition = pos + Vector3.new(0, 0.2, 0)
+        local fly = new("ParticleEmitter", {
+            Color = ColorSequence.new(Color3.fromRGB(28, 25, 20)),
+            Texture = DROP_TEX,
+            Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.05), NumberSequenceKeypoint.new(1, 0.02)}),
+            Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(1, 0.8)}),
+            Lifetime = NumberRange.new(1.5, 3.5), Speed = NumberRange.new(0.5, 2.5),
+            SpreadAngle = Vector2.new(180, 180), Rate = 4,
+            Acceleration = Vector3.new(0, 0.3, 0), LightEmission = 0,
+        }, att)
+        Debris:AddItem(att, math.min(S.BloodLifetime - 30, 40))
+        task.delay(30, function()
+            if att.Parent then fly.Rate = 12 end
+        end)
+    end)
+end
+
+function Blood.stumpBleed(stumpPart, duration)
+    if not S.StumpBleed then return end
+    duration = duration or 15
+    task.spawn(function()
+        local t = 0
+        while t < duration and stumpPart and stumpPart.Parent do
+            task.wait(0.4)
+            t = t + 0.4
+            local fade = 1 - t / duration
+            Blood.droplets(stumpPart.Position, Vector3.new(rnd(-0.5, 0.5), -1, rnd(-0.5, 0.5)), fade * 0.8)
+            Blood.spray(stumpPart.Position, Vector3.new(rnd(-0.3, 0.3), -0.8, rnd(-0.3, 0.3)), 2, 3, 9, 0.4, 5)
+            if S.BleedVapor then Blood.bleedVapor(stumpPart.Position) end
+        end
+    end)
+end
+
+local poolMergeList = {}
+function Blood.registerPoolForMerge(part)
+    if not S.PoolMerge then return end
+    table.insert(poolMergeList, {part = part, t = os.clock()})
+    for i = #poolMergeList - 1, 1, -1 do
+        local other = poolMergeList[i]
+        if not other.part.Parent then
+            table.remove(poolMergeList, i)
+        elseif (other.part.Position - part.Position).Magnitude < 2 then
+            local oldSz = other.part.Size
+            local newSz = Vector3.new(oldSz.X, math.min(oldSz.Y * 1.35, 8), math.min(oldSz.Z * 1.35, 8))
+            TS:Create(other.part, TweenInfo.new(2, Enum.EasingStyle.Quad), {Size = newSz}):Play()
+            TS:Create(part, TweenInfo.new(1.5), {Transparency = 1}):Play()
+            Debris:AddItem(part, 1.6)
+            break
+        end
+    end
+    if #poolMergeList > 60 then table.remove(poolMergeList, 1) end
+end
+
+function Blood.startBleedSound(torso)
+    if not S.BleedingLoop then return end
+    if torso:FindFirstChild("BleedLoop") then return end
+    local s = new("Sound", {
+        Name = "BleedLoop",
+        SoundId = pick(dripSounds),
+        Volume = 0.35 * S.SFXVolume,
+        Looped = true,
+        PlaybackSpeed = 1.0,
+        RollOffMinDistance = 5,
+        RollOffMaxDistance = 30,
+    }, torso)
+    s:Play()
+    return s
+end
+
+function Blood.stopBleedSound(torso)
+    local s = torso:FindFirstChild("BleedLoop")
+    if s then
+        TS:Create(s, TweenInfo.new(1.5), {Volume = 0}):Play()
+        Debris:AddItem(s, 1.6)
+    end
+end
+
+local Rigs = {}
+local localRig = nil
+
+local MOTOR_NAMES = {
+    R6 = {
+        Root = "RootJoint", Neck = "Neck", LShoulder = "Left Shoulder", RShoulder = "Right Shoulder",
+        LHip = "Left Hip", RHip = "Right Hip",
+    },
+    R15 = {
+        Root = "RootJoint", Waist = "Waist", Neck = "Neck", LShoulder = "LeftShoulder", RShoulder = "RightShoulder",
+        LElbow = "LeftElbow", RElbow = "RightElbow", LHip = "LeftHip", RHip = "RightHip",
+        LKnee = "LeftKnee", RKnee = "RightKnee", LAnkle = "LeftAnkle", RAnkle = "RightAnkle",
+    },
+}
+
+local function createRig(char)
+    local hum = char:WaitForChild("Humanoid", 5)
+    local hrp = char:WaitForChild("HumanoidRootPart", 5)
+    local head = char:WaitForChild("Head", 5)
+    if not (hum and hrp and head) then return nil end
+    local isR15 = hum.RigType == Enum.HumanoidRigType.R15
+    char:WaitForChild(isR15 and "RightFoot" or "Right Leg", 5)
+    task.wait()
+
+    local byName = {}
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("Motor6D") then byName[d.Name] = d end
+    end
+    local motors, c0 = {}, {}
+    for logical, real in pairs(MOTOR_NAMES[isR15 and "R15" or "R6"]) do
+        local m = byName[real]
+        if m then
+            motors[logical] = m
+            c0[logical] = m.C0
+        end
+    end
+
+    local legBase = 0
+    if not isR15 then
+        local leg = char:FindFirstChild("Left Leg")
+        legBase = leg and leg.Size.Y or 2
+    end
+    local scale = hrp.Size.Y / 2
+
+    local rig = {
+        char = char, hum = hum, hrp = hrp, head = head, type = isR15 and "R15" or "R6",
+        motors = motors, c0 = c0, posed = false,
+        torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso"),
+        baseHip = hum.HipHeight, baseHRP = hrp.Size, legBase = legBase, scale = scale,
+        standCenter = hum.HipHeight + hrp.Size.Y / 2 + legBase,
+        crouchDrop = (isR15 and 1.2 or 0.8) * scale,
+        crawlCenter = 0.72 * scale, crawlSizeY = 1.0 * scale,
+        charHeight = 5 * scale,
+        state = "HEALTHY", hpRatio = 1, holdArm = false, lostLimb = nil, feetBlood = 0, footSide = 1,
+        dead = false,
+        inj = {w = 0, limp = 0, hold = 0, flinch = 0, flinchDir = 1, stumbleT = -1, stumbleDir = 1, phase = 0, move = 0, breathe = 0},
+        tm = {drip = 3, cough = 6, whimper = 8, foot = 0, stump = 0.4, stumble = 5},
+    }
+    Rigs[char] = rig
+    return rig
+end
+
+local function newPose() return {rot = {}, off = {}} end
+local function addRot(p, name, x, y, z)
+    local r = p.rot[name]
+    if r then p.rot[name] = r + Vector3.new(x, y, z) else p.rot[name] = Vector3.new(x, y, z) end
+end
+local function addOff(p, name, x, y, z)
+    local r = p.off[name]
+    if r then p.off[name] = r + Vector3.new(x, y, z) else p.off[name] = Vector3.new(x, y, z) end
+end
+
+local function jointDelta(c0, rotCF, off)
+    local rc = c0.Rotation
+    local inv = rc:Inverse()
+    return CFrame.new(inv * off) * (inv * rotCF * rc)
+end
+
+local function applyPose(rig, pose)
+    for name, motor in pairs(rig.motors) do
+        if motor.Parent then
+            local r, o = pose.rot[name], pose.off[name]
+            if r or o then
+                local rotCF = r and CFrame.Angles(r.X, r.Y, r.Z) or CFrame.identity
+                motor.C0 = rig.c0[name] * jointDelta(rig.c0[name], rotCF, o or Vector3.zero)
+            else
+                motor.C0 = rig.c0[name]
+            end
+        end
+    end
+end
+
+local function resetPose(rig)
+    for name, motor in pairs(rig.motors) do
+        if motor.Parent then motor.C0 = rig.c0[name] end
+    end
+end
+
+local function setAnimate(rig, enabled)
+    local anim = rig.char:FindFirstChild("Animate")
+    if anim and (anim:IsA("LocalScript") or anim:IsA("Script")) then
+        pcall(function() anim.Disabled = not enabled end)
+    end
+    if not enabled then
+        local animator = rig.hum:FindFirstChildOfClass("Animator")
+        if animator then
+            for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do tr:Stop(0.1) end
+        end
+    end
+end
+
+local BANDAGE_PARTS = {
+    "Left Arm", "Right Arm", "Left Leg", "Right Leg", "Torso", "UpperTorso", "LowerTorso",
+    "LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm",
+    "LeftUpperLeg", "RightUpperLeg", "LeftLowerLeg", "RightLowerLeg",
+}
+
+local function addBandage(char, partName)
+    local part = char:FindFirstChild(partName)
+    if not part or not part:IsA("BasePart") or part:FindFirstChild("Bandage") then return end
+    local sz = part.Size
+    local b = new("Part", {
+        Name = "Bandage", Size = Vector3.new(sz.X + 0.08, math.max(0.3, sz.Y * 0.35), sz.Z + 0.08),
+        Color = Color3.fromRGB(228, 218, 196), Material = Enum.Material.Fabric,
+        CanCollide = false, CanQuery = false, CanTouch = false, Massless = true, CastShadow = false,
+    })
+    b.CFrame = part.CFrame * CFrame.new(0, rnd(-0.15, 0.15) * sz.Y, 0)
+    new("WeldConstraint", {Part0 = part, Part1 = b}, b)
+    b.Parent = part
+end
+
+local function syncBandages(rig, hp)
+    local char = rig.char
+    local target = 0
+    if S.Bandages then
+        if hp < 0.2 then target = 3 elseif hp < 0.4 then target = 2 elseif hp < 0.7 then target = 1 end
+    end
+    local existing, free = {}, {}
+    for _, name in ipairs(BANDAGE_PARTS) do
+        local part = char:FindFirstChild(name)
+        if part then
+            local b = part:FindFirstChild("Bandage")
+            if b then table.insert(existing, b) else table.insert(free, name) end
+        end
+    end
+    while #existing > target do
+        local b = table.remove(existing)
+        TS:Create(b, TweenInfo.new(0.5), {Transparency = 1}):Play()
+        Debris:AddItem(b, 0.6)
+    end
+    local need = target - #existing
+    for _ = 1, need do
+        if #free == 0 then break end
+        addBandage(char, table.remove(free, rng:NextInteger(1, #free)))
+    end
+end
+
+local function startAura(rig)
+    local torso = rig.torso
+    if not torso or torso:FindFirstChild("BloodAura") then return end
+    new("ParticleEmitter", {
+        Name = "BloodAura", Color = ColorSequence.new(Color3.fromRGB(120, 0, 0)), Texture = MIST_TEX,
+        Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 1.2)}),
+        Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.7), NumberSequenceKeypoint.new(1, 1)}),
+        Lifetime = NumberRange.new(1.5, 3), Speed = NumberRange.new(0.5, 2), SpreadAngle = Vector2.new(180, 180),
+        Rate = 8, LightEmission = 0,
+    }, torso)
+end
+
+local function stopAura(rig)
+    local torso = rig.torso
+    local a = torso and torso:FindFirstChild("BloodAura")
+    if a then a:Destroy() end
+end
+
+local function loseArm(rig, side)
+    if rig.lostLimb or not S.LoseLimbs or S.GoreLevel < 2 then return end
+    local char = rig.char
+    local R15 = rig.type == "R15"
+    local armName
+    if R15 then
+        armName = side == "L" and "LeftUpperArm" or "RightUpperArm"
+    else
+        armName = side == "L" and "Left Arm" or "Right Arm"
+    end
+    local arm = char:FindFirstChild(armName)
+    local motor = rig.motors[side .. "Shoulder"]
+    if not arm or not motor or not rig.torso then return end
+    rig.lostLimb = side
+
+    local set = {arm}
+    if R15 then
+        local lower = char:FindFirstChild(side == "L" and "LeftLowerArm" or "RightLowerArm")
+        local hand = char:FindFirstChild(side == "L" and "LeftHand" or "RightHand")
+        if lower then table.insert(set, lower) end
+        if hand then table.insert(set, hand) end
+    end
+    local origin = arm.Position
+    local vel = Vector3.new(rnd(-25, 25), rnd(15, 30), rnd(-25, 25))
+    for _, p in ipairs(set) do
+        local clone = p:Clone()
+        for _, c in ipairs(clone:GetDescendants()) do
+            if c:IsA("Motor6D") or c:IsA("Weld") or c:IsA("WeldConstraint") or c:IsA("Script") or c:IsA("LocalScript") then
+                c:Destroy()
+            end
+        end
+        clone.Anchored = false
+        clone.CanCollide = true
+        clone.CFrame = p.CFrame
+        clone.Parent = BloodFolder
+        clone.AssemblyLinearVelocity = vel
+        clone.AssemblyAngularVelocity = Vector3.new(rnd(-20, 20), rnd(-20, 20), rnd(-20, 20))
+        Debris:AddItem(clone, 20)
+    end
+    local stubCF = rig.torso.CFrame * rig.c0[side .. "Shoulder"]
+    motor:Destroy()
+    rig.motors[side .. "Shoulder"] = nil
+    rig.motors[side .. "Elbow"] = nil
+    for _, p in ipairs(set) do
+        for _, c in ipairs(p:GetChildren()) do
+            if c:IsA("Decal") or c:IsA("SpecialMesh") or c.Name == "Bandage" then c:Destroy() end
+        end
+        p.Anchored = true
+        p.CanCollide = false
+        p.Transparency = 1
+    end
+    local stub = new("Part", {
+        Name = "BloodyStub", Shape = Enum.PartType.Ball, Size = Vector3.new(0.9, 0.9, 0.9),
+        Color = Color3.fromRGB(140, 20, 20), Material = Enum.Material.SmoothPlastic,
+        CanCollide = false, Massless = true, CFrame = CFrame.new(stubCF.Position),
+    })
+    new("WeldConstraint", {Part0 = rig.torso, Part1 = stub}, stub)
+    stub.Parent = char
+    rig.stump = stub
+
+    Blood.mist(origin, 3)
+    Blood.droplets(origin, randDir(), 2)
+    Blood.spray(origin, nil, 30, 14, 40, 0.6, 30, char)
+    Blood.chunk("bone", origin, randDir(), 1)
+    Audio.at(origin, fleshSounds, 1.4, 0.75, 0.95)
+    Audio.at(origin, boneBreakSounds, 1.2, 0.85, 1.05)
+    if rig == localRig then
+        FX.lensBlood(1)
+        deafen(0.6, rng:NextNumber() < 0.5 and -1 or 1, 3)
+    end
+    if rig.stump then
+        Blood.stumpBleed(rig.stump, 15)
+    end
+end
+
+local CamS = {
+    bobT = 0, shake = 0, noiseT = 0, smoothSpeed = 0, strafe = 0, deathT = 0, deathSide = 1,
+    land = Spring.new(150, 13), kick = Spring.new(180, 14), lastVy = 0, fovCur = 70,
+    fpState = nil, prevStance = 0, wasDead = false,
+}
+
+local function camKick(ratio)
+    local k = clamp(ratio * 6, 0.3, 2)
+    CamS.kick:kick(Vector3.new(-0.5 * k * rnd(0.6, 1), rnd(-0.4, 0.4) * k, rnd(-1, 1) * 0.6 * k) * 3)
+    CamS.shake = CamS.shake + clamp(ratio * 8, 0.5, 4)
+end
+
+local function injuryPose(rig, pose, dt)
+    local inj = rig.inj
+    local hp = rig.hpRatio
+    local R15 = rig.type == "R15"
+    local v = rig.hrp.AssemblyLinearVelocity
+    local sp = Vector3.new(v.X, 0, v.Z).Magnitude
+    inj.move = damp(inj.move, clamp(sp / 12, 0, 1), 8, dt)
+    inj.phase = inj.phase + dt * sp * 0.55
+    inj.w = damp(inj.w, clamp((0.7 - hp) / 0.7, 0, 1), 2.5, dt)
+    inj.limp = damp(inj.limp, clamp((0.4 - hp) / 0.4, 0, 1), 2.5, dt)
+    inj.breathe = damp(inj.breathe, clamp((0.3 - hp) / 0.3, 0, 1), 2.5, dt)
+    inj.hold = damp(inj.hold, rig.holdArm and 1 or 0, 5, dt)
+    inj.flinch = inj.flinch * math.exp(-8 * dt)
+    if inj.stumbleT >= 0 then
+        inj.stumbleT = inj.stumbleT + dt
+        if inj.stumbleT > 0.8 then inj.stumbleT = -1 end
+    end
+    local t = os.clock()
+    local w, limp, m, ph = inj.w, inj.limp, inj.move, inj.phase
+    local lean = R15 and "Waist" or "Root"
+
+    addRot(pose, lean, -0.2 * w, 0, 0)
+    addRot(pose, "Neck", -0.15 * w + math.sin(t * 1.3) * 0.04 * w, 0, 0)
+
+    if limp > 0.02 then
+        addOff(pose, "Root", 0, -math.abs(math.sin(ph)) * 0.14 * limp * m, 0)
+        addRot(pose, "Root", 0, 0, math.sin(ph) * 0.07 * limp * m)
+        addRot(pose, "RHip", -0.25 * limp * m * (0.5 + 0.5 * math.sin(ph)), 0, 0)
+    end
+
+    if inj.hold > 0.01 then
+        local side = rig.lostLimb == "L" and "R" or "L"
+        local sgn = side == "L" and 1 or -1
+        addRot(pose, side .. "Shoulder", (R15 and 0.7 or 1.0) * inj.hold, 0, 0.9 * sgn * inj.hold)
+        if R15 then addRot(pose, side .. "Elbow", 1.5 * inj.hold, 0, 0) end
+    end
+
+    local f = inj.flinch
+    if f > 0.01 then
+        addRot(pose, lean, -0.45 * f, inj.flinchDir * 0.35 * f, 0)
+        addRot(pose, "Neck", -0.3 * f, 0, 0)
+        addRot(pose, "LShoulder", 0.5 * f, 0, -0.35 * f)
+        addRot(pose, "RShoulder", 0.5 * f, 0, 0.35 * f)
+    end
+
+    if inj.stumbleT >= 0 then
+        local e = math.sin(math.pi * inj.stumbleT / 0.8)
+        local d = inj.stumbleDir
+        addRot(pose, "Root", -0.12 * e, 0, 0.28 * e * d)
+        addRot(pose, lean, -0.2 * e, 0.25 * e * d, 0)
+        addRot(pose, "LShoulder", 0.4 * e, 0, -0.8 * e)
+        addRot(pose, "RShoulder", 0.4 * e, 0, 0.8 * e)
+        addOff(pose, "Root", 0, -0.2 * e, 0)
+    end
+
+    if inj.breathe > 0.02 then
+        local b = math.sin(t * 4.5) * inj.breathe
+        addRot(pose, lean, 0.035 * b, 0, 0)
+        addRot(pose, "Neck", -0.03 * b, 0, 0)
+    end
+end
+
+local function triggerFlinch(rig, ratio)
+    rig.inj.flinch = clamp(rig.inj.flinch + ratio * 4, 0, 1)
+    rig.inj.flinchDir = rng:NextNumber() < 0.5 and -1 or 1
+end
+
+local function triggerStumble(rig)
+    if rig.inj.stumbleT >= 0 then return end
+    rig.inj.stumbleT = 0
+    rig.inj.stumbleDir = rng:NextNumber() < 0.5 and -1 or 1
+    if rig == localRig then
+        CamS.kick:kick(Vector3.new(-1.2, 0, rig.inj.stumbleDir * 2.5))
+        CamS.shake = CamS.shake + 1.5
+    end
+end
+
+local ST = {
+    manual = 0, holdCrouch = false, forced = 0, target = 0, blend = 0, phase = 0, move = 0, drag = 0,
+    clearance = 99, probeT = 0, animOff = false, base = nil, lastMult = 1, lastSet = nil,
+    jumpOk = true, heightActive = false, uncrouchLock = 0,
+}
+
+local probeParams = RaycastParams.new()
+probeParams.FilterType = Enum.RaycastFilterType.Exclude
+probeParams.RespectCanCollide = true
+
+local function probeClearance(rig)
+    local filter = {rig.char, BloodFolder}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then table.insert(filter, p.Character) end
+    end
+    probeParams.FilterDescendantsInstances = filter
+    local hrp = rig.hrp
+    local root = hrp.Position
+    local floorRes = workspace:Raycast(root, Vector3.new(0, -8 * rig.scale, 0), probeParams)
+    local floorY = floorRes and floorRes.Position.Y or (root.Y - rig.standCenter)
+    local H = rig.charHeight
+    local up = Vector3.new(0, H * 1.15, 0)
+    local look, right = hrp.CFrame.LookVector, hrp.CFrame.RightVector
+    local vel = hrp.AssemblyLinearVelocity
+    local hv = Vector3.new(vel.X, 0, vel.Z)
+    local pts = {Vector3.zero, right * 0.7, -right * 0.7, look * 0.7, -look * 0.7}
+    if hv.Magnitude > 1 then
+        table.insert(pts, hv.Unit * 2.4)
+        table.insert(pts, hv.Unit * 1.4)
+    end
+    local best = H * 1.15
+    local base = Vector3.new(root.X, floorY + 0.3, root.Z)
+    for _, off in ipairs(pts) do
+        local r = workspace:Raycast(base + Vector3.new(off.X, 0, off.Z), up, probeParams)
+        if r then
+            local c = r.Position.Y - floorY
+            if c < best then best = c end
+        end
+    end
+    return best
+end
+
+local function stanceUpdate(rig, dt)
+    local hum = rig.hum
+    local dragTarget = 0
+    if not S.Stance or hum.Health <= 0 then
+        ST.target = 0
+    else
+        ST.probeT = ST.probeT - dt
+        if ST.probeT <= 0 then
+            ST.probeT = 0.07
+            ST.clearance = S.AutoStance and probeClearance(rig) or 99
+        end
+        local r = ST.clearance / rig.charHeight
+        local f
+        if r >= 0.95 then f = 0
+        elseif r >= 0.60 then f = (0.95 - r) / 0.35
+        elseif r >= 0.34 then f = 1 + (0.60 - r) / 0.26
+        else f = 2 end
+        ST.forced = clamp(f, 0, 2)
+        local manual = ST.holdCrouch and 0.7 or 0
+        if ST.manual == 1 then manual = 0.7 elseif ST.manual == 2 then manual = 2 end
+        local wound = 0
+        if S.WoundedCrawl and rig.hpRatio <= 0.10 then
+            wound = 2
+            dragTarget = 1
+        end
+        ST.target = math.max(manual, ST.forced, wound)
+    end
+    local rate = ST.target > ST.blend and 7 or 5
+    ST.blend = damp(ST.blend, ST.target, rate, dt)
+    if math.abs(ST.blend - ST.target) < 0.004 then ST.blend = ST.target end
+    ST.drag = damp(ST.drag, dragTarget, 3, dt)
+
+    local v = rig.hrp.AssemblyLinearVelocity
+    local sp = Vector3.new(v.X, 0, v.Z).Magnitude
+    if sp < 0.6 then sp = 0 end
+    ST.move = damp(ST.move, clamp(sp / math.max(hum.WalkSpeed, 1), 0, 1), 10, dt)
+    local k = lerp(0.85, 1.3, clamp(ST.blend - 1, 0, 1))
+    ST.phase = ST.phase + dt * sp * k
+end
+
+local function stanceBody(rig, dt)
+    local hum, hrp = rig.hum, rig.hrp
+    local b = ST.blend
+    local needOff = b > 0.02
+    if needOff ~= ST.animOff then
+        ST.animOff = needOff
+        setAnimate(rig, not needOff)
+    end
+    if needOff then
+        for _, m in pairs(rig.motors) do
+            if m.Parent then m.Transform = CFrame.identity end
+        end
+    end
+
+    if b > 0.001 then
+        local center
+        if b <= 1 then
+            center = rig.standCenter - rig.crouchDrop * b
+        else
+            center = lerp(rig.standCenter - rig.crouchDrop, rig.crawlCenter, b - 1)
+        end
+        local sizeY = rig.baseHRP.Y
+        if S.ShrinkCollision then sizeY = lerp(rig.baseHRP.Y, rig.crawlSizeY, clamp(b - 1, 0, 1)) end
+        local hip = center - sizeY / 2 - rig.legBase
+        pcall(function() hum.HipHeight = hip end)
+        hrp.Size = Vector3.new(rig.baseHRP.X, sizeY, rig.baseHRP.Z)
+        ST.heightActive = true
+    elseif ST.heightActive then
+        ST.heightActive = false
+        hum.HipHeight = rig.baseHip
+        hrp.Size = rig.baseHRP
+    end
+
+    local mult
+    if b <= 1 then mult = lerp(1, S.CrouchSpeed, b) else mult = lerp(S.CrouchSpeed, S.CrawlSpeed, b - 1) end
+    if S.InjuryAnimations then
+        mult = mult * (1 - 0.25 * rig.inj.limp)
+        if rig.inj.stumbleT >= 0 then mult = mult * 0.6 end
+    end
+    if ST.lastSet == nil or math.abs(hum.WalkSpeed - ST.lastSet) > 0.05 then
+        ST.base = hum.WalkSpeed / math.max(ST.lastMult, 0.05)
+    end
+    ST.lastMult = mult
+    ST.lastSet = ST.base * mult
+    hum.WalkSpeed = ST.lastSet
+
+    local jumpOk = b < 0.6
+    if jumpOk ~= ST.jumpOk then
+        ST.jumpOk = jumpOk
+        pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, jumpOk) end)
+    end
+end
+
+local function stancePose(rig, pose, dt)
+    local b = ST.blend
+    if b < 0.01 then return end
+    local wc = clamp(b <= 1 and b or 2 - b, 0, 1)
+    local wk = clamp(b - 1, 0, 1)
+    local m = ST.move
+    local s, c = math.sin(ST.phase), math.cos(ST.phase)
+    local R15 = rig.type == "R15"
+    local drag = ST.drag
+    local t = os.clock()
+
+    if wc > 0 then
+        local breath = math.sin(t * 1.8) * 0.02 * wc
+        if R15 then
+            local swing = 0.4 * m * (1 - 0.4 * wc)
+            local hip = 1.45 * wc
+            local hipL, hipR = hip + swing * s, hip - swing * s
+            local kL = -2.3 * wc - 0.5 * m * math.max(0, s) * wc
+            local kR = -2.3 * wc - 0.5 * m * math.max(0, -s) * wc
+            addRot(pose, "LHip", hipL, 0, -0.14 * wc)
+            addRot(pose, "RHip", hipR, 0, 0.14 * wc)
+            addRot(pose, "LKnee", kL, 0, 0)
+            addRot(pose, "RKnee", kR, 0, 0)
+            addRot(pose, "LAnkle", -(hipL + kL), 0, 0)
+            addRot(pose, "RAnkle", -(hipR + kR), 0, 0)
+            addRot(pose, "Waist", -0.45 * wc + breath, 0, 0)
+            addRot(pose, "Neck", 0.35 * wc, 0, 0)
+            addRot(pose, "LShoulder", (0.55 - 0.3 * m * s) * wc, 0, -0.12 * wc)
+            addRot(pose, "RShoulder", (0.55 + 0.3 * m * s) * wc, 0, 0.12 * wc)
+            addRot(pose, "LElbow", 0.7 * wc, 0, 0)
+            addRot(pose, "RElbow", 0.7 * wc, 0, 0)
+        else
+            local A = 0.8 * wc
+            local L = A * ((1 - m) + m * s)
+            local lean = 0.55 * wc
+            addRot(pose, "Root", -lean + breath, 0, 0)
+            addRot(pose, "LHip", L + lean, 0, -0.08 * wc)
+            addRot(pose, "RHip", -L + lean, 0, 0.08 * wc)
+            addRot(pose, "Neck", lean * 0.8, 0, 0)
+            addRot(pose, "LShoulder", (0.5 - 0.3 * m * s) * wc, 0, -0.1 * wc)
+            addRot(pose, "RShoulder", (0.5 + 0.3 * m * s) * wc, 0, 0.1 * wc)
+            addOff(pose, "Root", 0, 0.32 * m * (1 - s * s) * wc, 0)
+        end
+    end
+
+    if wk > 0 then
+        local slow = 1 - 0.8 * drag
+        local armAmp = 0.4 * (1 + 0.4 * drag)
+        addRot(pose, "Root", -1.5 * wk, 0.05 * s * m * wk, 0.10 * s * m * wk * (1 + drag))
+        addRot(pose, "Neck", (1.25 + 0.06 * c * m) * wk, 0, 0)
+        addRot(pose, "LShoulder", (2.6 + armAmp * s * m) * wk, 0, -0.3 * wk)
+        addRot(pose, "RShoulder", (2.6 - armAmp * s * m) * wk, 0, 0.3 * wk)
+        if R15 then
+            addRot(pose, "LElbow", (0.25 + 0.8 * m * math.max(0, -s)) * wk, 0, 0)
+            addRot(pose, "RElbow", (0.25 + 0.8 * m * math.max(0, s)) * wk, 0, 0)
+            addRot(pose, "LHip", (-0.12 + 0.3 * m * s * slow) * wk, 0, (-0.18 - 0.2 * drag) * wk)
+            addRot(pose, "RHip", (-0.12 - 0.3 * m * s * slow) * wk, 0, (0.18 + 0.2 * drag) * wk)
+            addRot(pose, "LKnee", -(0.18 + 0.75 * m * math.max(0, s) * slow) * wk, 0, 0)
+            addRot(pose, "RKnee", -(0.18 + 0.75 * m * math.max(0, -s) * slow) * wk, 0, 0)
+            addRot(pose, "Waist", 0, 0, -0.16 * s * m * wk * (1 + drag))
+        else
+            addRot(pose, "LHip", 0.28 * m * s * slow * wk, 0, -0.12 * wk)
+            addRot(pose, "RHip", -0.28 * m * s * slow * wk, 0, 0.12 * wk)
+        end
+    end
+end
+
+local WOUND_PARTS = {"Left Arm", "Right Arm", "Torso", "Left Leg", "Right Leg", "UpperTorso", "LowerTorso", "LeftUpperArm", "RightUpperLeg"}
+
+local function rigTimers(rig, dt)
+    if rig.dead then return end
+    local st, tm, char, hrp = rig.state, rig.tm, rig.char, rig.hrp
+    local v = hrp.AssemblyLinearVelocity
+    local sp = Vector3.new(v.X, 0, v.Z).Magnitude
+
+    if st ~= "HEALTHY" then
+        tm.drip = tm.drip - dt
+        if tm.drip <= 0 then
+            tm.drip = rnd(2.5, 4.5)
+            local part = char:FindFirstChild(pick(WOUND_PARTS))
+            if part and part:IsA("BasePart") then
+                Blood.spray(part.Position, Vector3.new(0, -1, 0), 2, 2, 6, 0.3, 4, char)
+                if rng:NextNumber() < 0.3 then
+                    Audio.at(part.Position, dripSounds, 0.25, 1, 1.2, 40)
+                end
+            end
+            rig.feetBlood = math.max(rig.feetBlood, 0.5)
+        end
+    end
+
+    if st == "AGONIZING" or st == "DYING" then
+        tm.cough = tm.cough - dt
+        if tm.cough <= 0 then
+            tm.cough = rnd(5, 9)
+            local head = rig.head
+            if S.Voices then Audio.at(head.Position, gurglingSounds, 0.5, 0.9, 1.1, 60) end
+            Blood.spray(head.Position, head.CFrame.LookVector + Vector3.new(0, -0.4, 0), 6, 6, 14, 0.5, 6, char)
+            Blood.mist(head.Position + head.CFrame.LookVector * 0.5, 0.4)
+            if S.InjuryAnimations then triggerFlinch(rig, 0.1) end
+        end
+        tm.stumble = tm.stumble - dt
+        if tm.stumble <= 0 then
+            tm.stumble = rnd(3.5, 7)
+            if sp > 3 and S.InjuryAnimations then triggerStumble(rig) end
+        end
+    end
+
+    if st == "CRITICAL" or st == "AGONIZING" or st == "DYING" then
+        tm.whimper = tm.whimper - dt
+        if tm.whimper <= 0 then
+            tm.whimper = rnd(6, 12)
+            if S.Voices and rig.torso then
+                Audio.at(rig.torso.Position, whimperSounds, 0.4 * S.WhimperVolume, 0.8, 1, 50)
+            end
+        end
+    end
+
+    if rig.stump and rig.stump.Parent then
+        tm.stump = tm.stump - dt
+        if tm.stump <= 0 then
+            tm.stump = 0.4
+            Blood.spray(rig.stump.Position, Vector3.new(rnd(-1, 1), -0.8, rnd(-1, 1)), 3, 4, 12, 0.5, 8, char)
+        end
+    end
+
+    if rig.bleedUntil and os.clock() < rig.bleedUntil then
+        tm.bleed = (tm.bleed or 0) - dt
+        if tm.bleed <= 0 then
+            tm.bleed = 0.45
+            Blood.spray(hrp.Position, Vector3.new(0, -1, 0), 2, 3, 8, 0.4, 6, char)
+            if S.BleedVapor and rng:NextNumber() < 0.35 then
+                Blood.bleedVapor(hrp.Position)
+            end
+        end
+        if rig.torso and not rig.torso:FindFirstChild("BleedLoop") then
+            Blood.startBleedSound(rig.torso)
+        end
+        if rig.torso then
+            local bl = rig.torso:FindFirstChild("BleedLoop")
+            if bl then
+                local lifeLeft = (rig.bleedUntil - os.clock()) / 7
+                bl.PlaybackSpeed = clamp(0.65 + lifeLeft * 0.35, 0.55, 1)
+            end
+        end
+    else
+        if rig.torso then Blood.stopBleedSound(rig.torso) end
+    end
+
+    if S.Footprints and rig.feetBlood > 0.02 and sp > 2 then
+        tm.foot = tm.foot - dt
+        if tm.foot <= 0 then
+            tm.foot = clamp(5.5 / sp, 0.22, 0.5)
+            rig.footSide = -rig.footSide
+            local cf = hrp.CFrame
+            local pos = hrp.Position + cf.RightVector * 0.45 * rig.footSide
+            Blood.footprint(pos, cf.LookVector, rig.feetBlood)
+            rig.feetBlood = rig.feetBlood - 0.06
+        end
+    end
+end
+
+local function updateRig(rig, dt, isLocal)
+    local hum = rig.hum
+    if not hum.Parent or not rig.char.Parent then return end
+    rig.hpRatio = hum.MaxHealth > 0 and clamp(hum.Health / hum.MaxHealth, 0, 1) or 1
+    local dead = hum.Health <= 0
+    if not dead then rigTimers(rig, dt) end
+
+    if rig.override then
+        applyPose(rig, rig.override(rig, dt))
+        return
+    end
+    local inj = rig.inj
+    local run = isLocal or rig.state ~= "HEALTHY" or rig.posed or inj.flinch > 0.004
+    if not run or dead then return end
+    local pose = newPose()
+    if S.InjuryAnimations then injuryPose(rig, pose, dt) end
+    if isLocal and S.Stance then stancePose(rig, pose, dt) end
+    local active = (inj.w + inj.limp + inj.hold + inj.flinch + inj.breathe) > 0.006
+        or inj.stumbleT >= 0 or (isLocal and ST.blend > 0.003)
+    if active then
+        applyPose(rig, pose)
+        rig.posed = true
+    elseif rig.posed then
+        resetPose(rig)
+        rig.posed = false
+    end
+end
+
+RunService.RenderStepped:Connect(function(dt)
+    local rig = localRig
+    if rig and rig.char.Parent and rig.hum.Parent then
+        if rig.hum.Health > 0 then
+            rig.hpRatio = rig.hum.MaxHealth > 0 and clamp(rig.hum.Health / rig.hum.MaxHealth, 0, 1) or 1
+            stanceUpdate(rig, dt)
+            stanceBody(rig, dt)
+        end
+        updateRig(rig, dt, true)
+        FX.update(dt, rig.hpRatio, rig.hum.Health <= 0)
+    else
+        FX.update(dt, 1, false)
+    end
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+    for char, rig in pairs(Rigs) do
+        if not char.Parent or not rig.hum.Parent then
+            Rigs[char] = nil
+        elseif rig ~= localRig then
+            updateRig(rig, dt, false)
+        end
+    end
+end)
+
+local ceilingDripTimer = 0
+RunService.Heartbeat:Connect(function(dt)
+    if not S.CeilingBloodDrip then return end
+    ceilingDripTimer = ceilingDripTimer + dt
+    if ceilingDripTimer < 2.5 then return end
+    ceilingDripTimer = 0
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local res = workspace:Raycast(cam.CFrame.Position, Vector3.new(0, 8, 0), baseRay)
+    if res and res.Instance then
+        local inst = res.Instance
+        if inst.Name:find("Blood") or inst.Name:find("Drip") or inst.Name:find("Pool") or inst.Name:find("Splat") then
+            Blood.ceilingDrip(res.Position)
+        end
+    end
+end)
+
+local HEAD_ATTACH = {HatAttachment = true, HairAttachment = true, FaceFrontAttachment = true, FaceCenterAttachment = true}
+
+local function setFirstPerson(rig, fp)
+    if CamS.fpState == fp then return end
+    CamS.fpState = fp
+    local hide = fp and S.HideHeadFP
+    rig.head.LocalTransparencyModifier = hide and 1 or 0
+    for _, d in ipairs(rig.char:GetChildren()) do
+        if d:IsA("Accessory") then
+            local h = d:FindFirstChild("Handle")
+            local att = h and h:FindFirstChildOfClass("Attachment")
+            if h and att and HEAD_ATTACH[att.Name] then
+                h.LocalTransparencyModifier = hide and 1 or 0
+            end
+        end
+    end
+end
+
+local function camUpdate(dt)
+    local cam = workspace.CurrentCamera
+    local rig = localRig
+    if not cam or not rig or not rig.hum.Parent or not rig.head.Parent then return end
+    local hum, hrp, head = rig.hum, rig.hrp, rig.head
+    local dead = hum.Health <= 0
+
+    local camCF = cam.CFrame
+    local firstPerson = (camCF.Position - head.Position).Magnitude < 1.5
+    setFirstPerson(rig, firstPerson)
+    if not S.CameraEffects then return end
+
+    local vel = hrp.AssemblyLinearVelocity
+    local hv = Vector3.new(vel.X, 0, vel.Z)
+    local speed = hv.Magnitude
+    CamS.smoothSpeed = damp(CamS.smoothSpeed, speed, 8, dt)
+    local sp = CamS.smoothSpeed
+    local maxSp = math.max(hum.WalkSpeed, 1)
+    local moveAmt = clamp(sp / maxSp, 0, 1.4)
+    local grounded = hum.FloorMaterial ~= Enum.Material.Air
+    local hp = rig.hpRatio
+    local low = dead and 0 or clamp((0.4 - hp) / 0.4, 0, 1)
+    local b = ST.blend
+    local t = os.clock()
+
+    if b > 1.2 then
+        CamS.bobT = ST.phase
+    else
+        CamS.bobT = CamS.bobT + dt * sp * 0.55
+    end
+    local ph = CamS.bobT
+    local bobAmt = S.HeadBob * moveAmt * (grounded and 1 or 0.1) * (1 - 0.35 * math.min(b, 1))
+    if dead then bobAmt = 0 end
+
+    local px, py, pz = 0, 0, 0
+    local roll, pitch, yaw = 0, 0, 0
+
+    if b > 1.2 then
+        px = math.sin(ph) * 0.14 * moveAmt * S.HeadBob
+        py = (math.abs(math.cos(ph)) * 0.05 - 0.02) * moveAmt * S.HeadBob
+        roll = roll + math.sin(ph) * 0.03 * moveAmt * S.HeadBob
+    else
+        px = math.sin(ph) * 0.06 * bobAmt
+        py = (math.abs(math.cos(ph)) * 0.07 - 0.035) * bobAmt
+        roll = roll + math.sin(ph) * 0.012 * bobAmt
+    end
+
+    if S.InjuryAnimations then
+        px = px + math.sin(t * 3.5) * 0.05 * rig.inj.limp * moveAmt
+        py = py + math.sin(t * 5.5) * 0.02 * rig.inj.breathe
+        roll = roll + math.sin(t * 0.8) * 0.02 * low * S.CameraRoll
+        pitch = pitch + math.sin(t * 1.1) * 0.012 * low
+    end
+
+    local sx = hv:Dot(camCF.RightVector)
+    CamS.strafe = damp(CamS.strafe, clamp(sx / maxSp, -1, 1), 8, dt)
+    roll = roll - CamS.strafe * 0.035 * S.CameraRoll
+
+    CamS.land:step(dt)
+    py = py + CamS.land.p.Y
+    if grounded and CamS.lastVy < -22 and vel.Y > -2 then
+        local lsh = S.LandingShake
+        CamS.land:kick(Vector3.new(0, -clamp(-CamS.lastVy, 0, 60) * 0.2 * lsh, 0))
+        CamS.shake = CamS.shake + clamp(-CamS.lastVy / 12, 0, 4) * lsh
+    end
+    CamS.lastVy = vel.Y
+
+    local stanceInt = math.floor(b + 0.5)
+    if stanceInt ~= CamS.prevStance then
+        CamS.prevStance = stanceInt
+        CamS.land:kick(Vector3.new(0, stanceInt > 0 and -2.2 or 1.2, 0))
+    end
+
+    local kick = CamS.kick:step(dt)
+    pitch, yaw, roll = pitch + kick.X * 0.02, yaw + kick.Y * 0.02, roll + kick.Z * 0.02 * S.CameraRoll
+    CamS.noiseT = CamS.noiseT + dt * 22
+    local pw = clamp(CamS.shake, 0, 14) * S.CameraShake * 0.0035
+    local ambient = 0.0006 * S.CameraNoise
+    pitch = pitch + math.noise(CamS.noiseT, 0, 0) * (pw * 2 + ambient)
+    yaw = yaw + math.noise(CamS.noiseT + 100, 0, 0) * (pw * 2 + ambient)
+    roll = roll + math.noise(CamS.noiseT + 200, 0, 0) * (pw * 2 + ambient)
+    CamS.shake = math.max(CamS.shake - 8 * dt, 0)
+
+    if dead and S.DeathCamera then
+        CamS.deathT = math.min(1, CamS.deathT + dt / 2.2)
+        local e = CamS.deathT * CamS.deathT * (3 - 2 * CamS.deathT)
+        roll = roll + CamS.deathSide * 0.5 * e
+        pitch = pitch - 0.12 * e
+        py = py - 1.3 * e
+    elseif not dead then
+        CamS.deathT = 0
+    end
+
+    local fpScale = firstPerson and 1 or 0
+    cam.CFrame = camCF
+        * CFrame.new(px * fpScale, py * (firstPerson and 1 or 0.4), 0)
+        * CFrame.Angles(pitch, yaw, roll * (firstPerson and 1 or 0.5))
+
+    if S.DynamicFOV then
+        local target = S.BaseFOV + sp * 0.18 + Post.fov.Value
+        target = target - 3 * math.min(b, 1) - 3 * clamp(b - 1, 0, 1) + FX.hbEnv * 2.2 * low
+        if dead then target = target - 10 * CamS.deathT end
+        CamS.fovCur = damp(cam.FieldOfView, target, 8, dt)
+        cam.FieldOfView = CamS.fovCur
+    end
+end
+
+RunService:BindToRenderStep("GoreCamera", Enum.RenderPriority.Camera.Value + 1, camUpdate)
+
+local grainTimer = 0
+RunService.RenderStepped:Connect(function(dt)
+    grainTimer = grainTimer + dt
+    if grainTimer < 0.05 then return end
+    grainTimer = 0
+    local gi = FX_V11.grainIntensity or 0
+    if gi < 0.05 then
+        for _, gp in ipairs(grainPixels) do gp.BackgroundTransparency = 1 end
+        return
+    end
+    for _, gp in ipairs(grainPixels) do
+        gp.Position = UDim2.fromScale(rnd(0, 1), rnd(0, 1))
+        gp.BackgroundTransparency = rnd(1 - gi * 0.7, 1)
+        gp.BackgroundColor3 = rng:NextNumber() < 0.5 and Color3.new(1, 1, 1) or Color3.new(0, 0, 0)
+    end
+end)
+
+RunService.RenderStepped:Connect(function(dt)
+    if not FX_V11.lensDropsActive then return end
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local up = cam.CFrame.UpVector
+    local tiltX = -up.X
+    local tiltY = -up.Y
+    for _, d in ipairs(lensDrops) do
+        if d.active then
+            d.posY = clamp(d.posY + tiltY * dt * 0.08, 0, 0.95)
+            d.posX = clamp(d.posX + tiltX * dt * 0.04, 0.01, 0.99)
+            d.frame.Position = UDim2.fromScale(d.posX, d.posY)
+        end
+    end
+end)
+
+local function limbName(rig, which)
+    local R15 = rig.type == "R15"
+    local map = {
+        LA = R15 and "LeftUpperArm" or "Left Arm", RA = R15 and "RightUpperArm" or "Right Arm",
+        LL = R15 and "LeftUpperLeg" or "Left Leg", RL = R15 and "RightUpperLeg" or "Right Leg",
+        H = "Head",
+    }
+    return map[which]
+end
+
+local function ragdoll(rig, impulseDir, force, detach)
+    local char = rig.char
+    pcall(function() rig.hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+    rig.override = nil
+    for _, v in ipairs(char:GetDescendants()) do
+        if v:IsA("Motor6D") and v.Part0 and v.Part1 then
+            if not (detach and detach[v.Part1]) then
+                local a0 = new("Attachment", {CFrame = v.C0}, v.Part0)
+                local a1 = new("Attachment", {CFrame = v.C1}, v.Part1)
+                new("BallSocketConstraint", {
+                    Attachment0 = a0, Attachment1 = a1, LimitsEnabled = true,
+                    UpperAngle = v.Name == "Neck" and 40 or 70,
+                    TwistLimitsEnabled = true, TwistLowerAngle = -45, TwistUpperAngle = 45,
+                }, v.Part0)
+                new("NoCollisionConstraint", {Part0 = v.Part0, Part1 = v.Part1}, v.Part0)
+            end
+            v:Destroy()
+        end
+    end
+    for _, p in ipairs(char:GetChildren()) do
+        if p:IsA("BasePart") then
+            p.CanCollide = p.Name ~= "HumanoidRootPart"
+        end
+    end
+    if impulseDir then
+        task.wait(0.04)
+        local f = (force or 1) * S.RagdollForce
+        for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                p.AssemblyLinearVelocity = impulseDir.Unit * rnd(15, 35) * f + Vector3.new(0, rnd(8, 15) * f, 0)
+            end
+        end
+    end
+    if rig.torso then Audio.at(rig.torso.Position, boneBreakSounds, 1, 0.9, 1.1) end
+end
+
+local function convulse(rig)
+    task.spawn(function()
+        for _ = 1, 8 do
+            task.wait(0.15)
+            if not rig.char.Parent then break end
+            for _, p in ipairs(rig.char:GetChildren()) do
+                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                    p.AssemblyAngularVelocity = Vector3.new(rnd(-20, 20), rnd(-20, 20), rnd(-20, 20))
+                end
+            end
+        end
+    end)
+end
+
+local function hideCharacter(char)
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") then
+            d.Transparency = 1
+            d.CanCollide = false
+        elseif d:IsA("Decal") or d:IsA("Texture") then
+            pcall(function() d.Transparency = 1 end)
+        end
+    end
+end
+
+local function severEffects(part, scale)
+    local p = part.Position
+    Blood.mist(p, 2.5 * scale)
+    Blood.droplets(p, randDir(), 2 * scale)
+    Blood.spray(p, nil, 22, 14, 40, 0.6, 25)
+    Blood.chunk("bone", p, randDir(), 1)
+    Audio.at(p, boneBreakSounds, 1.3, 0.85, 1.05)
+    Audio.at(p, fleshSounds, 1, 0.75, 0.95)
+end
+
+local function collapsePose(rig, t)
+    local pose = newPose()
+    local e = t * t
+    if rig.type == "R15" then
+        addRot(pose, "LHip", 1.5 * e, 0, -0.2 * e)
+        addRot(pose, "RHip", 1.3 * e, 0, 0.2 * e)
+        addRot(pose, "LKnee", -2.4 * e, 0, 0)
+        addRot(pose, "RKnee", -2.2 * e, 0, 0)
+        addRot(pose, "Waist", -0.7 * e, 0, 0.2 * e)
+        addRot(pose, "Neck", -0.5 * e, 0, 0.2 * e)
+        addRot(pose, "LShoulder", 0.2 * e, 0, -0.4 * e)
+        addRot(pose, "RShoulder", 0.2 * e, 0, 0.4 * e)
+        addRot(pose, "LElbow", 0.3 * e, 0, 0)
+        addOff(pose, "Root", 0, -1.1 * e, 0)
+    else
+        addRot(pose, "Root", -0.6 * e, 0, 0.15 * e)
+        addRot(pose, "LHip", 0.9 * e + 0.5 * e, 0, -0.2 * e)
+        addRot(pose, "RHip", 0.9 * e + 0.5 * e, 0, 0.2 * e)
+        addRot(pose, "Neck", -0.5 * e, 0, 0)
+        addRot(pose, "LShoulder", 0.2 * e, 0, -0.4 * e)
+        addRot(pose, "RShoulder", 0.2 * e, 0, 0.4 * e)
+        addOff(pose, "Root", 0, -0.7 * e, 0)
+    end
+    return pose
+end
+
+local DeathFns = {}
+
+DeathFns.Collapse = function(rig, ctx)
+    local t0 = os.clock()
+    rig.override = function(r) return collapsePose(r, clamp((os.clock() - t0) / 0.8, 0, 1)) end
+    Audio.at(rig.hrp.Position, whimperSounds, 0.8 * S.WhimperVolume, 0.7, 0.9)
+    task.wait(0.8)
+    ragdoll(rig, ctx.dir, 0.4)
+    Blood.pool(rig.hrp.Position, 2.4, 16)
+    Blood.spray(rig.hrp.Position, nil, 10, 6, 16, 0.6, 12, rig.char)
+    convulse(rig)
+end
+
+DeathFns.Knockback = function(rig, ctx)
+    ragdoll(rig, ctx.dir + Vector3.new(0, 0.5, 0), 1.9)
+    local p = rig.torso and rig.torso.Position or rig.hrp.Position
+    Blood.droplets(p, -ctx.dir, 2)
+    Blood.spray(p, -ctx.dir + Vector3.yAxis * 0.3, 24, 14, 38, 0.5, 25, rig.char)
+    Audio.impact(p, true)
+    for _, part in ipairs(rig.char:GetChildren()) do
+        if part:IsA("BasePart") then
+            part.AssemblyAngularVelocity = Vector3.new(rnd(-12, 12), rnd(-8, 8), rnd(-12, 12))
+        end
+    end
+    task.delay(0.9, function() if rig.torso and rig.torso.Parent and not rig.deadPoolDone then rig.deadPoolDone = true; Blood.pool(rig.torso.Position, 2.5, 14) end end)
+end
+
+DeathFns.Headshot = function(rig, ctx)
+    local head = rig.head
+    Blood.mist(head.Position, 4)
+    Blood.droplets(head.Position, -ctx.dir + Vector3.yAxis * 0.3, 3)
+    Blood.spray(head.Position, nil, 28, 14, 40, 0.7, 30)
+    Audio.at(head.Position, fleshSounds, 1.4, 0.75, 0.95)
+    for _ = 1, 2 do Blood.chunk("tooth", head.Position, randDir()) end
+    head.Transparency = 1
+    for _, v in ipairs(head:GetChildren()) do
+        if v:IsA("Decal") or v:IsA("SpecialMesh") then v:Destroy() end
+    end
+    ragdoll(rig, ctx.dir, 0.5)
+    Blood.arterial(rig.torso, 4.5, rig.char)
+    Blood.wallSpatter(head.Position, 5)
+    convulse(rig)
+    task.delay(1.1, function() if rig.torso and rig.torso.Parent and not rig.deadPoolDone then rig.deadPoolDone = true; Blood.pool(rig.torso.Position, 3, 18) end end)
+end
+
+DeathFns.Decapitate = function(rig, ctx)
+    local head = rig.head
+    ragdoll(rig, ctx.dir, 0.6, {[head] = true})
+    severEffects(head, 1)
+    head.CanCollide = true
+    head.AssemblyLinearVelocity = ctx.dir * 22 + Vector3.new(0, 26, 0)
+    head.AssemblyAngularVelocity = Vector3.new(rnd(-15, 15), rnd(-15, 15), rnd(-15, 15))
+    Blood.arterial(rig.torso, 5, rig.char)
+    convulse(rig)
+    task.delay(1.1, function() if rig.torso and rig.torso.Parent and not rig.deadPoolDone then rig.deadPoolDone = true; Blood.pool(rig.torso.Position, 3, 18) end end)
+end
+
+DeathFns.Dismember = function(rig, ctx)
+    local all = {"LA", "RA", "LL", "RL"}
+    local detach, parts = {}, {}
+    for _ = 1, rng:NextInteger(2, 4) do
+        if #all == 0 then break end
+        local k = table.remove(all, rng:NextInteger(1, #all))
+        local p = rig.char:FindFirstChild(limbName(rig, k))
+        if p then
+            detach[p] = true
+            table.insert(parts, p)
+        end
+    end
+    ragdoll(rig, ctx.dir, 0.7, detach)
+    for _, p in ipairs(parts) do
+        severEffects(p, 1)
+        p.CanCollide = true
+        p.AssemblyLinearVelocity = randDir() * 30 + Vector3.new(0, 20, 0)
+        p.AssemblyAngularVelocity = Vector3.new(rnd(-15, 15), rnd(-15, 15), rnd(-15, 15))
+        Blood.arterial(rig.torso, 2.5, rig.char)
+        task.wait(0.08)
+    end
+    convulse(rig)
+    if rig.torso and not rig.deadPoolDone then
+        rig.deadPoolDone = true
+        Blood.pool(rig.torso.Position, 3.2, 18)
+    end
+end
+
+DeathFns.Bisect = function(rig, ctx)
+    local upper = rig.char:FindFirstChild("UpperTorso")
+    if rig.type ~= "R15" or not upper then
+        return DeathFns.Dismember(rig, ctx)
+    end
+    ragdoll(rig, ctx.dir, 0.5, {[upper] = true})
+    local p = upper.Position
+    Blood.mist(p, 4)
+    Blood.droplets(p, Vector3.yAxis, 3)
+    Blood.spray(p, nil, 36, 12, 36, 0.8, 35)
+    for _ = 1, 4 do Blood.chunk("meat", p, randDir(), 1) end
+    Audio.at(p, fleshSounds, 1.5, 0.7, 0.9)
+    upper.AssemblyLinearVelocity = ctx.dir * 14 + Vector3.new(0, 14, 0)
+    Blood.arterial(rig.char:FindFirstChild("LowerTorso") or rig.hrp, 4, rig.char)
+    convulse(rig)
+    if not rig.deadPoolDone then
+        rig.deadPoolDone = true
+        Blood.pool(p, 3.8, 18)
+    end
+end
+
+DeathFns.Explode = function(rig, ctx)
+    local p = rig.hrp.Position
+    Blood.mist(p, 5)
+    Blood.droplets(p, Vector3.yAxis, 4)
+    Audio.at(p, fleshSounds, 1.6, 0.65, 0.85)
+    Audio.at(p, boneBreakSounds, 1.2, 0.8, 1)
+    Blood.spray(p, nil, 60, 14, 45, 0.9, 40)
+    if not rig.deadPoolDone then
+        rig.deadPoolDone = true
+        Blood.pool(p, 3.4, 12)
+    end
+    for _ = 1, 5 do Blood.chunk("meat", p, randDir(), 1) end
+    for _ = 1, 3 do Blood.chunk("bone", p, randDir(), 1) end
+    for _ = 1, 2 do Blood.chunk("tooth", p, randDir()) end
+    for _ = 1, 3 do Blood.chunk("skin", p, randDir()) end
+    Blood.wallSpatter(p, 7)
+    hideCharacter(rig.char)
+    if rig == localRig then CamS.shake = CamS.shake + 10 end
+end
+
+DeathFns.Meat = function(rig, ctx)
+    ragdoll(rig, ctx.dir, 0.9)
+    local p = rig.hrp.Position
+    Blood.mist(p, 2.5)
+    for _ = 1, 5 do Blood.chunk("skin", p, randDir()) end
+    for _ = 1, 2 do Blood.chunk("meat", p, randDir(), 0.8) end
+    Blood.arterial(rig.torso, 5, rig.char)
+    Audio.at(p, gurglingSounds, 1.2, 0.8, 1)
+    convulse(rig)
+    if not rig.deadPoolDone then
+        rig.deadPoolDone = true
+        Blood.pool(p, 3, 16)
+    end
+end
+
+DeathFns.Disintegrate = function(rig, ctx)
+    ragdoll(rig, ctx.dir, 0.3)
+    if not rig.torso then return end
+    local ash = new("ParticleEmitter", {
+        Color = ColorSequence.new(Color3.fromRGB(70, 70, 70), Color3.fromRGB(25, 25, 25)),
+        Texture = MIST_TEX, Rate = 90, Lifetime = NumberRange.new(1.2, 2.4), Speed = NumberRange.new(1, 5),
+        SpreadAngle = Vector2.new(60, 60), Acceleration = Vector3.new(0, 4, 0), LightEmission = 0,
+        Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(1, 1.6)}),
+        Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 1)}),
+    }, rig.torso)
+    for _, p in ipairs(rig.char:GetDescendants()) do
+        if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+            TS:Create(p, TweenInfo.new(2.8, Enum.EasingStyle.Quad), {Color = Color3.fromRGB(35, 35, 35), Transparency = 1}):Play()
+        elseif p:IsA("Decal") then
+            TS:Create(p, TweenInfo.new(2.4), {Transparency = 1}):Play()
+        end
+    end
+    Audio.at(rig.torso.Position, gurglingSounds, 0.7, 1.2, 1.5)
+    task.delay(2.8, function() ash.Enabled = false end)
+end
+
+DeathFns.Burn = function(rig, ctx)
+    ragdoll(rig, ctx.dir, 0.5)
+    for _, p in ipairs(rig.char:GetChildren()) do
+        if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+            new("Fire", {Heat = 8, Size = 5, Color = Color3.fromRGB(255, 120, 20), SecondaryColor = Color3.fromRGB(200, 40, 0)}, p)
+            if p.Name == "Torso" or p.Name == "UpperTorso" or p.Name == "Head" then
+                new("Smoke", {Color = Color3.fromRGB(30, 30, 30), Opacity = 0.5, RiseVelocity = 6, Size = 3}, p)
+            end
+            TS:Create(p, TweenInfo.new(3, Enum.EasingStyle.Quad), {Color = Color3.fromRGB(25, 20, 18)}):Play()
+        end
+    end
+    Audio.at(rig.hrp.Position, whimperSounds, 1.1 * S.WhimperVolume, 1.3, 1.6)
+    task.delay(9, function()
+        for _, p in ipairs(rig.char:GetDescendants()) do
+            if p:IsA("Fire") or p:IsA("Smoke") then p:Destroy() end
+        end
+    end)
+end
+
+local DEATH_GORE = {
+    Collapse = 1, Knockback = 1, Disintegrate = 1, Burn = 1,
+    Headshot = 2, Decapitate = 2, Meat = 2, Dismember = 2, Bisect = 3, Explode = 3,
+}
+local DEATH_LIST = {"Random", "Collapse", "Knockback", "Headshot", "Decapitate", "Dismember", "Bisect", "Explode", "Meat", "Disintegrate", "Burn"}
+
+local function applyDeath(rig)
+    local char = rig.char
+    local isLocal = rig == localRig
+    rig.override = nil
+    rig.dead = true
+    rig.deadPoolDone = false
+    setAnimate(rig, false)
+    if S.DeathScream and rig.hrp then
+        Audio.at(rig.hrp.Position, DEATH_SCREAM, 1.0, 0.92, 1.06, 90)
+    end
+
+    local style = S.DeathStyle
+    if style == "Random" or not DeathFns[style] then
+        local pool = {}
+        for name, g in pairs(DEATH_GORE) do
+            if g <= S.GoreLevel then table.insert(pool, name) end
+        end
+        if #pool == 0 then pool = {"Collapse"} end
+        style = pick(pool)
+    end
+    rig.deathStyle = style
+
+    local v = rig.hrp.AssemblyLinearVelocity
+    local hv = Vector3.new(v.X, 0, v.Z)
+    local dir = hv.Magnitude > 4 and hv.Unit or -rig.hrp.CFrame.LookVector
+    local ctx = {dir = dir}
+
+    Blood.bodyBlood(char, 100)
+    if isLocal then
+        CamS.deathSide = rng:NextNumber() < 0.5 and -1 or 1
+        numTween(Post.fov, -15, 1.5)
+        deathFlash.BackgroundTransparency = 0.2
+        TS:Create(deathFlash, TweenInfo.new(1.2), {BackgroundTransparency = 1}):Play()
+        FX.hit(0.35)
+        FX.lensBlood(1.4)
+        FX.crack(1.2)
+        FX.addEdge(0.5)
+        CamS.shake = CamS.shake + 15
+        Post.muffleT.Value = 0.8
+        numTween(Post.muffleT, 0.5, 3)
+        deafen(1.0, 0, S.DeafnessDuration)
+        task.delay(0.3, function() FX.deathFlashback() end)
+        FX.eyeBlood(-1)
+        task.delay(0.1, function() FX.eyeBlood(1) end)
+        FX.chromAberration(1)
+    end
+    task.spawn(function()
+        local ok, err = pcall(DeathFns[style], rig, ctx)
+        if not ok then
+            warn("[DynamicBlood] Error in death '" .. style .. "': " .. tostring(err))
+        end
+    end)
+end
+
+local RANK = {HEALTHY = 0, WOUNDED = 1, CRITICAL = 2, AGONIZING = 3, DYING = 4}
+
+local function updateInjuryState(rig)
+    if rig.dead then return end
+    local hp = rig.hpRatio
+    local old = rig.state
+    local new = "HEALTHY"
+    if hp <= 0.10 then new = "DYING"
+    elseif hp <= 0.20 then new = "AGONIZING"
+    elseif hp <= 0.40 then new = "CRITICAL"
+    elseif hp <= 0.70 then new = "WOUNDED" end
+
+    syncBandages(rig, hp)
+    if new == old then return end
+    rig.state = new
+    if rig.hum.Health <= 0 then return end
+
+    if RANK[new] > RANK[old] then
+        if S.Footprints then rig.feetBlood = math.max(rig.feetBlood, 0.7) end
+        if RANK[new] >= 2 then
+            rig.holdArm = true
+            startAura(rig)
+            local arm = rig.char:FindFirstChild(limbName(rig, "LA"))
+            if arm then stainCharacterPart(arm, 1) end
+            if rig.torso then
+                Audio.at(rig.torso.Position, whimperSounds, 0.7 * S.WhimperVolume, 0.9, 1.1)
+                if S.Voices and new ~= "WOUNDED" then
+                    Audio.at(rig.torso.Position, WOUNDED_GASP, S.GaspVolume, 0.92, 1.08, 70)
+                end
+            end
+        end
+        if RANK[new] >= 3 and not rig.lostLimb then
+            loseArm(rig, rng:NextNumber() < 0.5 and "L" or "R")
+        end
+        if new == "DYING" and rig == localRig then
+            FX.lensBlood(1)
+            FX.hit(0.25)
+        end
+    else
+        if hp > 0.40 then rig.holdArm = false end
+        if hp > 0.70 then stopAura(rig) end
+    end
+end
+
+local adrenalineCooldown = 0
+
+local function onHealthChanged(rig, newHealth)
+    local hum = rig.hum
+    local old = rig.lastHealth or newHealth
+    rig.lastHealth = newHealth
+    local isLocal = rig == localRig
+    rig.hpRatio = hum.MaxHealth > 0 and clamp(newHealth / hum.MaxHealth, 0, 1) or 1
+    local char = rig.char
+
+    if newHealth > old then
+        if isLocal then
+            FX.heal(clamp((newHealth - old) / hum.MaxHealth * 3, 0.15, 0.5))
+            FX.edge = math.max(0, FX.edge - 0.4)
+            Deaf.amount = math.max(0, Deaf.amount - 0.3)
+        end
+        if rig.hpRatio > 0.7 then rig.feetBlood = 0 end
+    elseif newHealth < old then
+        local dmg = old - newHealth
+        local ratio = dmg / hum.MaxHealth
+        local root = rig.hrp
+        Blood.bodyBlood(char, dmg)
+        if S.BloodHands then
+            local leftHand = char:FindFirstChild(rig.type == "R15" and "LeftHand" or "Left Arm")
+            local rightHand = char:FindFirstChild(rig.type == "R15" and "RightHand" or "Right Arm")
+            if leftHand and rng:NextNumber() < 0.7 then stainCharacterPart(leftHand, clamp(ratio * 4, 0.3, 1)) end
+            if rightHand and rng:NextNumber() < 0.7 then stainCharacterPart(rightHand, clamp(ratio * 4, 0.3, 1)) end
+        end
+        if S.InjuryAnimations then triggerFlinch(rig, ratio) end
+        rig.feetBlood = math.max(rig.feetBlood, 0.4)
+        local count = clamp(math.floor(dmg / 1.5), 2, 14)
+        Blood.spray(root.Position, nil, count, 10, 30, 0.6, dmg, char)
+        Blood.mist(root.Position, clamp(ratio * 4, 0.4, 1.5))
+        if ratio > 0.1 then
+            Blood.droplets(root.Position, randDir(), clamp(ratio * 5, 0.6, 2))
+        end
+        local lethal = newHealth <= 0
+        if ratio > 0.15 and not lethal then
+            Blood.pool(root.Position, clamp(ratio * 8, 1, 3), 8)
+            rig.bleedUntil = os.clock() + 7
+        end
+        if ratio > 0.2 then Blood.wallSpatter(root.Position, 3) end
+        if ratio > 0.15 and rig.torso and S.LungFoam then
+            Blood.lungFoam(rig.torso.Position)
+        end
+        if ratio > 0.12 and S.WallSmear then
+            local cam = workspace.CurrentCamera
+            if cam then
+                local lookDir = cam.CFrame.LookVector
+                Blood.bodyPartSmear(root.Position + Vector3.new(rnd(-0.5,0.5), 0.5, rnd(-0.5,0.5)), lookDir)
+            end
+        end
+        if S.RainBlood and isRaining() then
+            local rainColor = Color3.fromRGB(
+                clamp(math.floor(WET_BLOOD.R * 255 + 40), 0, 255),
+                clamp(math.floor(WET_BLOOD.G * 255 + 10), 0, 255),
+                clamp(math.floor(WET_BLOOD.B * 255 + 10), 0, 255)
+            )
+        end
+        Audio.at(root.Position, fleshSounds, clamp(0.5 + ratio * 2, 0.5, 1.4), 0.85, 1.1)
+
+        if isLocal then
+            FX.hit(ratio)
+            FX.addEdge(ratio * 1.5)
+            FX.damageNumber(dmg, ratio > 0.15)
+            camKick(ratio)
+            if ratio > 0.1 then FX.lensBlood(clamp(ratio * 4, 0.5, 1.5)) end
+            if ratio > 0.15 then FX.crack(clamp(ratio * 4, 0.5, 1.5)) end
+            if ratio > 0.2 and rng:NextNumber() < S.TinnitusChance then FX.tinnitus() end
+            if ratio > 0.1 then
+                local side = rng:NextNumber() < 0.5 and -1 or 1
+                deafen(clamp(ratio * 1.5, 0.15, 1) * S.DeafnessStrength, side, S.DeafnessDuration * clamp(ratio * 2, 0.5, 1.5))
+            end
+            if S.AdrenalineEnabled and rig.hpRatio < 0.15 and os.clock() > adrenalineCooldown then
+                adrenalineCooldown = os.clock() + 3
+                FX.adrenaline()
+            end
+            if ratio > 0.1 and rng:NextNumber() < 0.45 then
+                FX.eyeBlood(rng:NextNumber() < 0.5 and -1 or 1)
+            end
+            if ratio > 0.25 then
+                FX.doubleVision(3)
+            end
+            if ratio > 0.08 then
+                FX.chromAberration(clamp(ratio * 3, 0.2, 1))
+            end
+            if ratio > 0.3 and rng:NextNumber() < 0.4 then
+                FX_V11.eyeInjured = rng:NextNumber() < 0.5 and -1 or 1
+                FX.diopticBlur(FX_V11.eyeInjured, clamp(ratio * 2, 0.3, 0.75))
+            end
+            if ratio > 0.2 then
+                FX.activateLensDrops(rng:NextInteger(2, 5))
+            end
+            if ratio > 0.2 and S.DirectionalTinnitus and rig.torso then
+                local hitPos = rig.hrp.Position + randDir() * 3
+                local tinAtt = new("Attachment", nil, workspace.Terrain)
+                tinAtt.WorldPosition = hitPos
+                local tinS = new("Sound", {
+                    SoundId = tinnitusSound,
+                    Volume = clamp(ratio * 0.8, 0.2, 0.9) * S.SFXVolume,
+                    RollOffMode = Enum.RollOffMode.Inverse,
+                    RollOffMinDistance = 4,
+                    RollOffMaxDistance = 30,
+                }, tinAtt)
+                tinS:Play()
+                TS:Create(tinS, TweenInfo.new(2.5), {Volume = 0}):Play()
+                Debris:AddItem(tinAtt, 4)
+            end
+        end
+    end
+    updateInjuryState(rig)
+end
+
+local RUN_ID = tostring(os.clock()) .. tostring(rng:NextInteger(1, 1e6))
+
+local function onLocalSpawn(rig)
+    local hum = rig.hum
+    ST.manual, ST.blend, ST.target, ST.forced, ST.phase, ST.move, ST.drag = 0, 0, 0, 0, 0, 0, 0
+    ST.animOff, ST.heightActive, ST.jumpOk = false, false, true
+    ST.base, ST.lastMult, ST.lastSet = hum.WalkSpeed, 1, hum.WalkSpeed
+    CamS.fpState, CamS.deathT, CamS.shake, CamS.prevStance, CamS.lastVy = nil, 0, 0, 0, 0
+    pcall(function() hum.CameraOffset = Vector3.zero end)
+    Deaf.amount = 0
+    Deaf.timer = 0
+    FX.reset()
+end
+
+local function registerCharacter(char)
+    if char:GetAttribute("GoreRun") == RUN_ID then return end
+    char:SetAttribute("GoreRun", RUN_ID)
+    task.spawn(function()
+        local rig = createRig(char)
+        if not rig then return end
+        rig.lastHealth = rig.hum.Health
+        pcall(function() rig.hum.BreakJointsOnDeath = false end)
+        if char == LocalPlayer.Character then
+            localRig = rig
+            onLocalSpawn(rig)
+        end
+        updateInjuryState(rig)
+        rig.hum.HealthChanged:Connect(function(h) onHealthChanged(rig, h) end)
+        rig.hum.Died:Connect(function() applyDeath(rig) end)
+        rig.hum.StateChanged:Connect(function(_, state)
+            if rig == localRig and state == Enum.HumanoidStateType.Landed then
+                CamS.shake = CamS.shake + 1
+            end
+        end)
+    end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    if p.Character then registerCharacter(p.Character) end
+    p.CharacterAdded:Connect(registerCharacter)
+end
+Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(registerCharacter) end)
+
+local function tryRegister(inst)
+    if inst:IsA("Humanoid") and inst.Parent and inst.Parent:IsA("Model") then
+        registerCharacter(inst.Parent)
+    end
+end
+workspace.DescendantAdded:Connect(tryRegister)
+for _, d in ipairs(workspace:GetDescendants()) do tryRegister(d) end
+
+workspace.ChildAdded:Connect(function(child)
+    if child:IsA("Explosion") then
+        if S.ExplosionBloodReaction then
+            for _, player in ipairs(Players:GetPlayers()) do
+                local character = player.Character
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if root and humanoid and humanoid.Health > 0 then
+                    local delta = root.Position - child.Position
+                    local distance = delta.Magnitude
+                    if distance > 0.1 and distance <= math.max(child.BlastRadius, 12) then
+                        local intensity = clamp(1 - distance / math.max(child.BlastRadius, 12), 0.1, 1)
+                        Blood.spray(root.Position, delta.Unit, math.floor(3 + intensity * 8), 6, 18, 0.45, intensity * 12, character)
+                        Blood.pool(root.Position, intensity * 2.2, 3)
+                    end
+                end
+            end
+        end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        local to = child.Position - cam.CFrame.Position
+        local d = to.Magnitude
+        if d < 60 then
+            local intensity = clamp((60 - d) / 60, 0, 1)
+            CamS.shake = CamS.shake + intensity * 6
+            Post.muffleT.Value = math.max(Post.muffleT.Value, intensity * 0.8)
+            numTween(Post.muffleT, 0, 2.5)
+            local side = 0
+            if d > 3 then
+                side = signOf(to.Unit:Dot(cam.CFrame.RightVector))
+            end
+            deafen(intensity * S.DeafnessStrength, side, S.DeafnessDuration * clamp(intensity, 0.3, 1.5))
+        end
+    end
+end)
+
+local function toggleManual(level)
+    ST.manual = (ST.manual == level) and 0 or level
+end
+
+CAS:BindAction("GoreCrouch", function(_, state)
+    if state == Enum.UserInputState.Begin then toggleManual(1) end
+    return Enum.ContextActionResult.Pass
+end, true, Enum.KeyCode.C)
+CAS:BindAction("GoreProne", function(_, state)
+    if state == Enum.UserInputState.Begin then toggleManual(2) end
+    return Enum.ContextActionResult.Pass
+end, true, Enum.KeyCode.Z)
+pcall(function()
+    CAS:SetTitle("GoreCrouch", "Crouch")
+    CAS:SetTitle("GoreProne", "Prone")
+end)
+
+UIS.InputBegan:Connect(function(input, gp)
+    if not gp and input.KeyCode == Enum.KeyCode.LeftControl then ST.holdCrouch = true end
+end)
+UIS.InputEnded:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.LeftControl then ST.holdCrouch = false end
+end)
+UIS.JumpRequest:Connect(function()
+    if ST.manual > 0 then ST.manual = 0 end
+end)
+
+onSettingChanged("HideHeadFP", function() CamS.fpState = nil end)
+
+local SCHEMA = {
+    {cat = "Guide", items = {
+        {"_g1", "text", "Welcome to Dynamic Blood v11",
+[[This script simulates a full client-side injury, gore, and survival system. Blood, wounds, screen distortion, camera behavior, stance, breathing, and audio all react dynamically to your health, movement, and the damage you take.
+
+Use the tabs at the top of the panel to navigate categories. Every toggle, slider, and option below is documented in the Guide tabs so you know exactly what each value does before you change it.
+
+All settings are persistent: press SAVE at the bottom to write your configuration to disk. Press RESET to restore every value to its factory default.]]},
+
+        {"_g2", "text", "Blood System — Overview",
+[[Controls how blood is produced, sprayed, pooled, and how long it lasts.
+
+• Blood Amount – Global multiplier for the total quantity of blood drops, sprays, and splats.
+• Blood Brightness – Changes how light or dark both wet and dry blood appear (0.5 = very dark, 1.5 = pale).
+• Blood Temperature – Recolors blood: Normal (classic crimson), Frozen (dark violet-red), Boiling (bright orange-red).
+• Water Blood – When enabled, blood hitting water creates a diffusing cloud instead of a floating splat.
+• Fly Effects – Spawns small fly/mote particles hovering around fresh blood pools.
+• Blood on Hands – Stains your hands with blood whenever you take damage.
+• Gore Intensity – Master multiplier for gore density (drops, mist, physical chunks).
+• Splat Duration – How long splats and pools remain visible before fading (in seconds).
+• Max Splats – Hard cap of active splat groups. Higher = more gore on screen, more performance cost.
+• Blood Pool Size – Size multiplier for ground pools.
+• Body Blood Amount – How much blood staining attaches to body parts when damaged.]]},
+
+        {"_g3", "text", "Blood System — Placement",
+[[• Wall Drips – If enabled, blood on walls slowly drips down over time.
+• Wall Spatter – Enables blood splatter on nearby walls when you are hit hard.
+• Blood Footprints – You leave bloody footprints while wounded and moving.
+• Body Blood – Enables blood stains directly attached to body parts of characters.
+• Arterial Spray – Enables high-pressure arterial spray from severed limbs and the neck.
+• Blood Mist – Enables the blood mist cloud that puffs out from fresh wounds.]]},
+
+        {"_g4", "text", "Advanced Blood Features",
+[[• Viscosity by Wound Type – Different wound types produce different blood patterns (arterial = fine fast spray, contusion = dense slow pool, lung = pink foam).
+• Lung Foam – Chest/lung hits produce pink foamy bubbles mixed with red droplets.
+• Ceiling Blood Drip – If you stand under a bloodied ceiling, drops fall onto you over time.
+• Bleed Vapor (Hot Blood) – Fresh wounds on living characters emit a faint red vapor.
+• Wall Smear – Body parts leave smears on walls when you collide with them.
+• Arched Footprints – Footprints are split into heel + toe segments for realism.
+• Rain Dilutes Blood – Blood color is washed out while rain is detected in the world.
+• Pool Coagulation Skin – Old blood pools develop a darker, slightly wrinkled surface layer.
+• Insects Attracted to Blood – Flies gather around blood pools after 30 seconds.
+• Stump Bleeds After Amputation – Your stump keeps bleeding for 15 seconds after losing a limb.
+• Pools Coalesce – Nearby blood pools merge into one larger pool over time.]]},
+
+        {"_g5", "text", "Gore & Death System",
+[[Controls how the body reacts to lethal damage.
+
+• Gore Level – 1 = light (collapse only), 2 = medium (headshots, dismemberment), 3 = extreme (bisect, explode).
+• Death Style – Choose a specific death or leave Random. Available styles: Collapse, Knockback, Headshot, Decapitate, Dismember, Bisect, Explode, Meat, Disintegrate, Burn.
+• Death Camera – If on, the camera tilts, drops, and rolls when you die.
+• Lose Arm When Dying – At critical HP, one of your arms is torn off automatically.
+• Bandages – Spawns visible bandages on your limbs as HP drops below certain thresholds.
+• Physical Debris – Enables chunks of flesh, bone, teeth, and skin flying from wounds.
+• Chunk Density – Chance (0 to 1) that any given hit spawns a physical chunk.
+• Chunk Force – Multiplier for the launch velocity of debris.
+• Chunk Lifetime – How long debris stays on the ground (in seconds).
+• Ragdoll Force – Multiplier for the impulse applied when your body ragdolls on death.]]},
+
+        {"_g6", "text", "Camera System",
+[[Controls how the camera reacts to movement, damage, and death.
+
+• Camera Effects – Master toggle for every camera effect below.
+• Head Bob – Intensity of walking bob (0 = off, 2 = very strong).
+• Camera Shake – Multiplier for shake caused by hits, landings, and explosions.
+• Camera Roll – Multiplier for tilt and lean while strafing or crawling.
+• Ambient Camera Noise – Adds subtle random camera jitter (0 = off).
+• Landing Shake – Extra shake when falling from a great height.
+• Dynamic FOV – Field of view expands when sprinting and narrows when injured.
+• Base FOV – The neutral field of view when idle (50 to 110).
+• Hide Head in 1st Person – Hides your head and head accessories in first person.]]},
+
+        {"_g7", "text", "Movement & Stance",
+[[Controls crouching, crawling, and wound-driven movement.
+
+• Stance System – Enables the manual stance system: C = crouch, Z = crawl, LeftCtrl = hold crouch.
+• Auto Stance by Space – Automatically crouches/crawls when the ceiling above you is too low.
+• Crouch Speed – Walk speed multiplier while crouched (0.2 to 1).
+• Crawl Speed – Walk speed multiplier while crawling (0.1 to 0.8).
+• Crawl When Dying – Forces you into a crawl when HP is below 10%.
+• Injury Animations – Enables limp, flinch, stumble, and heavy-breathing animations.
+• Shrink Collision – Shrinks your hitbox while crawling so you can enter tight spaces.]]},
+
+        {"_g8", "text", "Screen Effects",
+[[Post-processing and overlay effects applied to your viewport.
+
+• Screen Effects – Master toggle for every screen effect below.
+• Vignette – Darkens the edges of the screen as your HP drops.
+• Vignette Intensity – Multiplier for vignette strength.
+• Lens Blood – Spawns blood splatters on the camera lens when hit.
+• Lens Blood Amount – Multiplier for lens blood density.
+• Screen Cracks – Fake cracks appear on the screen after heavy hits.
+• Damage Numbers – Floating damage numbers appear when you take damage.
+• Damage Number Size – Scale of the floating numbers.
+• Color Grading – Desaturates and tints the screen as you lose blood.
+• Blur – Blurs the screen proportional to blood loss.
+• Depth of Field – Simulates tunnel focus when severely injured.
+• Quality – Master performance preset (1 = low, 2 = medium, 3 = high).]]},
+
+        {"_g9", "text", "Advanced Screen Effects",
+[[• Eye Blood – Blood trickles down one half of your vision after head hits.
+• Double Vision – Slight offset ghost image after a heavy hit.
+• Chromatic Aberration – RGB color separation on violent impacts.
+• Breathing Vignette Pulse – Vignette breathes in sync with your heartbeat.
+• Hypoxic Tunnel Vision – Below 20% HP, the borders of your vision close in.
+• Film Grain – Grainy noise overlay at low HP.
+• Dioptric Eye Blur – One side of your vision blurs after a critical head hit.
+• Lens Gravity Drops – Blood drops on the lens slide down when you tilt the camera.
+• Death Flashbacks – Rapid white/red/black flashes play during death.]]},
+
+        {"_g10", "text", "Audio & Hearing",
+[[Controls how sound behaves when you are wounded or damaged.
+
+• SFX Volume – Master volume for all gore sounds (0 to 2).
+• Heartbeat – Enables the audible heartbeat when low HP.
+• Death Scream – Plays a scream the moment you die.
+• Gasp Volume – Volume of the wounded gasp when entering critical state.
+• Heartbeat Volume – Multiplier for heartbeat volume.
+• Muffled Audio – Sounds become muffled as your HP drops (equalizer).
+• Whimpers / Coughs – Enables voice-related vocalizations.
+• Whimper Volume – Volume of whimpers.
+• Deafness Strength – Multiplier for how deaf you become after loud hits.
+• Deafness Duration – How long deafness lasts (in seconds).
+• Tinnitus Chance – Chance (0 to 1) that a hit triggers ringing in the ears.
+• Adrenaline Rush – Brief speed, saturation, and blur surge when near death.
+• Explosion Blood Reaction – Explosions shake the camera, muffle audio, and spray blood on nearby players.
+• Directional 3D Tinnitus – Tinnitus is anchored to the impact location for spatial hearing.
+• Continuous Bleed Loop Sound – A looping dripping sound plays while actively bleeding.]]},
+
+        {"_g11", "text", "Tips & Presets",
+[[• Performance mode: Lower Quality to 1, reduce Max Splats to ~80, disable Physical Debris.
+• Hardcore mode: Gore Level 3, Death Style Random, disable Bandages, enable Crawl When Dying.
+• Cinematic mode: Enable every camera effect, Head Bob 1.5, Camera Shake 1.5, enable Death Flashbacks and Double Vision.
+• Minimal mode: Disable Screen Effects, Physical Debris, and Bandages for a cleaner look.
+• Press RESET at the bottom of the panel to restore every setting to its default value.
+• Press SAVE to persist your configuration across sessions (stored as GoreV11_Settings.json in your executor's workspace folder).
+• Press F6 or click the SET button on the left side of the screen to open this panel at any time.]]},
+    }},
+    {cat = "Blood", items = {
+        {"BloodAmount", "slider", "Blood Amount", 0.2, 2, 0.1},
+        {"BloodBrightness", "slider", "Blood Brightness", 0.5, 1.5, 0.05},
+        {"BloodTemperature", "option", "Blood Temperature", {"Normal", "Frozen", "Boiling"}},
+        {"WaterBlood", "toggle", "Blood Diffusion in Water"},
+        {"FlyEffects", "toggle", "Fly / Mote Effects"},
+        {"BloodHands", "toggle", "Blood on Hands"},
+        {"GoreIntensity", "slider", "Gore Intensity", 0.5, 2, 0.1},
+        {"BloodLifetime", "slider", "Splat Duration (s)", 10, 120, 5},
+        {"MaxSplats", "slider", "Max Splats", 60, 500, 20},
+        {"BloodPoolSize", "slider", "Blood Pool Size", 0.5, 3, 0.1},
+        {"BodyBloodAmount", "slider", "Body Blood Amount", 0.2, 2, 0.1},
+        {"WallDrips", "toggle", "Wall Drips"},
+        {"WallSpatterEnabled", "toggle", "Wall Spatter"},
+        {"Footprints", "toggle", "Blood Footprints"},
+        {"BodyBlood", "toggle", "Body Blood"},
+        {"ArterialSpray", "toggle", "Arterial Spray"},
+        {"BloodMistEnabled", "toggle", "Blood Mist"},
+        {"ViscosityBlood", "toggle", "Viscosity by Wound Type"},
+        {"LungFoam", "toggle", "Lung Foam (Chest Wounds)"},
+        {"CeilingBloodDrip", "toggle", "Ceiling Blood Drip"},
+        {"BleedVapor", "toggle", "Bleed Vapor (Hot Blood)"},
+        {"WallSmear", "toggle", "Wall Smear by Body Part"},
+        {"ArchedFootprint", "toggle", "Arched Footprints"},
+        {"RainBlood", "toggle", "Rain Dilutes Blood"},
+        {"PoolSkin", "toggle", "Pool Coagulation Skin"},
+        {"InsectAttract", "toggle", "Insects Attracted to Blood"},
+        {"StumpBleed", "toggle", "Stump Bleeds After Amputation"},
+        {"PoolMerge", "toggle", "Pools Coalesce"},
+    }},
+    {cat = "Gore", items = {
+        {"GoreLevel", "slider", "Gore Level (1-3)", 1, 3, 1},
+        {"DeathStyle", "option", "Death Style", DEATH_LIST},
+        {"DeathCamera", "toggle", "Death Camera"},
+        {"LoseLimbs", "toggle", "Lose Arm When Dying"},
+        {"Bandages", "toggle", "Bandages"},
+        {"Debris", "toggle", "Physical Debris"},
+        {"ChunkCount", "slider", "Chunk Density (0-1)", 0, 1, 0.05},
+        {"ChunkForce", "slider", "Chunk Force", 0.5, 2, 0.1},
+        {"ChunkLifetime", "slider", "Chunk Lifetime (s)", 5, 60, 1},
+        {"RagdollForce", "slider", "Ragdoll Force", 0.5, 2, 0.1},
+    }},
+    {cat = "Camera", items = {
+        {"CameraEffects", "toggle", "Camera Effects"},
+        {"HeadBob", "slider", "Head Bob", 0, 2, 0.1},
+        {"CameraShake", "slider", "Camera Shake", 0, 2, 0.1},
+        {"CameraRoll", "slider", "Camera Roll", 0, 2, 0.1},
+        {"CameraNoise", "slider", "Ambient Camera Noise", 0, 2, 0.05},
+        {"LandingShake", "slider", "Landing Shake", 0, 2, 0.1},
+        {"DynamicFOV", "toggle", "Dynamic FOV"},
+        {"BaseFOV", "slider", "Base FOV", 50, 110, 1},
+        {"HideHeadFP", "toggle", "Hide Head in 1st Person"},
+    }},
+    {cat = "Movement", items = {
+        {"Stance", "toggle", "Stance System (C / Z)"},
+        {"AutoStance", "toggle", "Auto Stance by Space"},
+        {"CrouchSpeed", "slider", "Crouch Speed", 0.2, 1, 0.05},
+        {"CrawlSpeed", "slider", "Crawl Speed", 0.1, 0.8, 0.05},
+        {"WoundedCrawl", "toggle", "Crawl When Dying"},
+        {"InjuryAnimations", "toggle", "Injury Animations"},
+        {"ShrinkCollision", "toggle", "Shrink Collision When Crawling"},
+    }},
+    {cat = "Screen", items = {
+        {"ScreenFX", "toggle", "Screen Effects"},
+        {"Vignette", "toggle", "Vignette"},
+        {"VignetteIntensity", "slider", "Vignette Intensity", 0, 2, 0.1},
+        {"ScreenBlood", "toggle", "Lens Blood"},
+        {"ScreenBloodAmount", "slider", "Lens Blood Amount", 0.2, 2, 0.1},
+        {"ScreenCrackEnabled", "toggle", "Screen Cracks"},
+        {"DamageNumbers", "toggle", "Damage Numbers"},
+        {"DamageNumberScale", "slider", "Damage Number Size", 0.5, 2, 0.05},
+        {"ColorGrading", "toggle", "Color Grading"},
+        {"BlurFX", "toggle", "Blur"},
+        {"DepthOfField", "toggle", "Depth of Field"},
+        {"Quality", "slider", "Quality (1-3)", 1, 3, 1},
+        {"EyeBlood", "toggle", "Eye Blood (Head Hits)"},
+        {"DoublVision", "toggle", "Double Vision (Heavy Hit)"},
+        {"ChromAberration", "toggle", "Chromatic Aberration"},
+        {"BreathingVignette", "toggle", "Breathing Vignette Pulse"},
+        {"HypoxicTunnel", "toggle", "Hypoxic Tunnel Vision"},
+        {"FilmGrain", "toggle", "Film Grain (Low HP)"},
+        {"DiopticBlur", "toggle", "Dioptric Eye Blur"},
+        {"LensTilt", "toggle", "Lens Gravity Drops"},
+        {"DeathFlashbacks", "toggle", "Death Flashbacks"},
+    }},
+    {cat = "Audio", items = {
+        {"SFXVolume", "slider", "SFX Volume", 0, 2, 0.1},
+        {"HeartbeatSFX", "toggle", "Heartbeat"},
+        {"DeathScream", "toggle", "Death Scream"},
+        {"GaspVolume", "slider", "Gasp Volume", 0, 2, 0.1},
+        {"HeartbeatVolume", "slider", "Heartbeat Volume", 0, 2, 0.1},
+        {"Muffle", "toggle", "Muffled Audio"},
+        {"Voices", "toggle", "Whimpers / Coughs"},
+        {"WhimperVolume", "slider", "Whimper Volume", 0, 2, 0.1},
+        {"DeafnessStrength", "slider", "Deafness Strength", 0, 2, 0.1},
+        {"DeafnessDuration", "slider", "Deafness Duration (s)", 1, 10, 0.5},
+        {"TinnitusChance", "slider", "Tinnitus Chance", 0, 1, 0.05},
+        {"AdrenalineEnabled", "toggle", "Adrenaline Rush"},
+        {"ExplosionBloodReaction", "toggle", "Explosion Blood Reaction"},
+        {"DirectionalTinnitus", "toggle", "Directional 3D Tinnitus"},
+        {"BleedingLoop", "toggle", "Continuous Bleed Loop Sound"},
+    }},
+}
+
+local function buildSettingsUI()
+    local ui = new("ScreenGui", {
+        Name = "GoreSettingsUI", ResetOnSpawn = false, DisplayOrder = 50, IgnoreGuiInset = true,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    }, PlayerGui)
+    local BG = Color3.fromRGB(13, 15, 21)
+    local PANEL = Color3.fromRGB(20, 23, 31)
+    local ROW = Color3.fromRGB(27, 31, 41)
+    local ACC = Color3.fromRGB(202, 37, 48)
+    local ACC2 = Color3.fromRGB(111, 25, 47)
+    local MUTED = Color3.fromRGB(151, 160, 176)
+    local WHITE = Color3.fromRGB(242, 244, 248)
+
+    local panel = new("Frame", {
+        Name = "MainPanel", Size = UDim2.new(0, 430, 0, 510),
+        Position = UDim2.new(0.5, -215, 0.5, -255), BackgroundColor3 = PANEL,
+        BorderSizePixel = 0, Visible = false, ClipsDescendants = true,
+    }, ui)
+    new("UICorner", {CornerRadius = UDim.new(0, 15)}, panel)
+    new("UIStroke", {Color = Color3.fromRGB(76, 39, 52), Thickness = 1.2, Transparency = 0.12}, panel)
+    new("UISizeConstraint", {MinSize = Vector2.new(320, 400), MaxSize = Vector2.new(480, 620)}, panel)
+    new("UIGradient", {
+        Rotation = 28,
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(28, 29, 40)),
+            ColorSequenceKeypoint.new(0.55, PANEL),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(17, 19, 27)),
+        }),
+    }, panel)
+
+    local topAccent = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 3), BackgroundColor3 = ACC, BorderSizePixel = 0, ZIndex = 2,
+    }, panel)
+    new("UIGradient", {Rotation = 0, Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, ACC2), ColorSequenceKeypoint.new(0.5, ACC), ColorSequenceKeypoint.new(1, Color3.fromRGB(236, 98, 82)),
+    })}, topAccent)
+
+    local header = new("Frame", {Size = UDim2.new(1, 0, 0, 70), BackgroundTransparency = 1}, panel)
+    local title = new("TextLabel", {
+        Size = UDim2.new(1, -90, 0, 29), Position = UDim2.fromOffset(18, 10), BackgroundTransparency = 1,
+        Text = "DYNAMIC BLOOD", TextColor3 = WHITE, Font = Enum.Font.GothamBlack, TextSize = 18,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, header)
+    local subtitle = new("TextLabel", {
+        Size = UDim2.new(1, -90, 0, 18), Position = UDim2.fromOffset(19, 39), BackgroundTransparency = 1,
+        Text = "SYSTEM CONTROL  /  CLIENT PROFILE  —  v11", TextColor3 = MUTED, Font = Enum.Font.Code, TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, header)
+    local close = new("TextButton", {
+        Name = "Close", Size = UDim2.fromOffset(32, 30), Position = UDim2.new(1, -43, 0, 13),
+        BackgroundColor3 = Color3.fromRGB(47, 31, 40), Text = "X", Font = Enum.Font.GothamBold,
+        TextColor3 = WHITE, TextSize = 13, AutoButtonColor = false, BorderSizePixel = 0,
+    }, header)
+    new("UICorner", {CornerRadius = UDim.new(0, 8)}, close)
+    new("UIStroke", {Color = Color3.fromRGB(110, 45, 57), Transparency = 0.35, Thickness = 1}, close)
+
+    local divider = new("Frame", {
+        Size = UDim2.new(1, -28, 0, 1), Position = UDim2.fromOffset(14, 69),
+        BackgroundColor3 = Color3.fromRGB(55, 59, 73), BackgroundTransparency = 0.25, BorderSizePixel = 0,
+    }, panel)
+
+    local tabs = new("ScrollingFrame", {
+        Size = UDim2.new(1, -24, 0, 38), Position = UDim2.fromOffset(12, 78), BackgroundTransparency = 1,
+        ScrollBarThickness = 0, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.X,
+        ScrollingDirection = Enum.ScrollingDirection.X, BorderSizePixel = 0,
+    }, panel)
+    new("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, tabs)
+
+    local pages, tabButtons, refreshers = {}, {}, {}
+    local activePage = nil
+    local function tween(obj, duration, props, style)
+        local tw = TS:Create(obj, TweenInfo.new(duration, style or Enum.EasingStyle.Quint, Enum.EasingDirection.Out), props)
+        tw:Play()
+        return tw
+    end
+    local function showPage(name)
+        activePage = name
+        for n, pg in pairs(pages) do
+            local selected = n == name
+            pg.Visible = selected
+            if selected then pg.CanvasPosition = Vector2.zero end
+        end
+        for n, b in pairs(tabButtons) do
+            local selected = n == name
+            tween(b, 0.16, {BackgroundColor3 = selected and ACC or ROW})
+            b.TextColor3 = selected and WHITE or MUTED
+            local stroke = b:FindFirstChildOfClass("UIStroke")
+            if stroke then tween(stroke, 0.16, {Transparency = selected and 0.15 or 0.85}) end
+        end
+    end
+    local function makeRow(page, h)
+        local row = new("Frame", {
+            Size = UDim2.new(1, -4, 0, h), BackgroundColor3 = ROW,
+            BorderSizePixel = 0, ClipsDescendants = false,
+        }, page)
+        new("UICorner", {CornerRadius = UDim.new(0, 9)}, row)
+        new("UIStroke", {Color = Color3.fromRGB(54, 60, 74), Thickness = 1, Transparency = 0.72}, row)
+        return row
+    end
+    local function rowLabel(row, text, w)
+        return new("TextLabel", {
+            Size = UDim2.new(w or 0.62, 0, 1, 0), Position = UDim2.fromOffset(12, 0), BackgroundTransparency = 1,
+            Text = text, TextColor3 = WHITE, Font = Enum.Font.GothamMedium, TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+        }, row)
+    end
+
+    local function addToggle(page, key, label)
+        local row = makeRow(page, 42)
+        rowLabel(row, label, 0.72)
+        local pill = new("TextButton", {
+            Size = UDim2.fromOffset(48, 23), Position = UDim2.new(1, -61, 0.5, -11), Text = "",
+            AutoButtonColor = false, BackgroundColor3 = Color3.fromRGB(53, 58, 70), BorderSizePixel = 0,
+        }, row)
+        new("UICorner", {CornerRadius = UDim.new(1, 0)}, pill)
+        local knob = new("Frame", {
+            Size = UDim2.fromOffset(17, 17), Position = UDim2.fromOffset(3, 3),
+            BackgroundColor3 = WHITE, BorderSizePixel = 0,
+        }, pill)
+        new("UICorner", {CornerRadius = UDim.new(1, 0)}, knob)
+        local function render(animated)
+            local on = S[key] == true
+            if animated then
+                tween(pill, 0.18, {BackgroundColor3 = on and ACC or Color3.fromRGB(53, 58, 70)})
+                tween(knob, 0.18, {Position = on and UDim2.new(1, -20, 0, 3) or UDim2.fromOffset(3, 3)})
+            else
+                pill.BackgroundColor3 = on and ACC or Color3.fromRGB(53, 58, 70)
+                knob.Position = on and UDim2.new(1, -20, 0, 3) or UDim2.fromOffset(3, 3)
+            end
+        end
+        pill.MouseButton1Click:Connect(function()
+            setSetting(key, not S[key]); render(true); saveSettings()
+        end)
+        render(false)
+        table.insert(refreshers, function() render(false) end)
+    end
+
+    local function addSlider(page, key, label, mn, mx, step)
+        local row = makeRow(page, 56)
+        rowLabel(row, label, 0.68)
+        local val = new("TextLabel", {
+            Size = UDim2.new(0.25, -8, 0, 22), Position = UDim2.new(0.72, 0, 0, 1), BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Color3.fromRGB(245, 112, 115),
+            TextXAlignment = Enum.TextXAlignment.Right,
+        }, row)
+        local hit = new("TextButton", {
+            Size = UDim2.new(1, -24, 0, 22), Position = UDim2.fromOffset(12, 29),
+            BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
+        }, row)
+        local bar = new("Frame", {
+            Size = UDim2.new(1, 0, 0, 5), Position = UDim2.new(0, 0, 0.5, -2),
+            BackgroundColor3 = Color3.fromRGB(53, 58, 71), BorderSizePixel = 0,
+        }, hit)
+        new("UICorner", {CornerRadius = UDim.new(1, 0)}, bar)
+        local fill = new("Frame", {Size = UDim2.fromScale(0, 1), BackgroundColor3 = ACC, BorderSizePixel = 0}, bar)
+        new("UICorner", {CornerRadius = UDim.new(1, 0)}, fill)
+        new("UIGradient", {Color = ColorSequence.new(ACC2, Color3.fromRGB(242, 87, 91))}, fill)
+        local knob = new("Frame", {
+            Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5),
+            BackgroundColor3 = WHITE, BorderSizePixel = 0,
+        }, bar)
+        new("UICorner", {CornerRadius = UDim.new(1, 0)}, knob)
+        new("UIStroke", {Color = ACC, Thickness = 1.5, Transparency = 0.05}, knob)
+        local function render(animated)
+            local a = clamp((S[key] - mn) / math.max(mx - mn, 0.0001), 0, 1)
+            if animated then
+                tween(fill, 0.08, {Size = UDim2.fromScale(a, 1)}, Enum.EasingStyle.Quad)
+                tween(knob, 0.08, {Position = UDim2.fromScale(a, 0.5)}, Enum.EasingStyle.Quad)
+            else
+                fill.Size = UDim2.fromScale(a, 1); knob.Position = UDim2.fromScale(a, 0.5)
+            end
+            val.Text = step >= 1 and string.format("%d", math.floor(S[key] + 0.5)) or string.format("%.2f", S[key])
+        end
+        local dragging = false
+        local function setFromX(x)
+            local a = clamp((x - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
+            local v = mn + a * (mx - mn)
+            v = clamp(math.floor(v / step + 0.5) * step, mn, mx)
+            setSetting(key, v); render(true)
+        end
+        hit.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true; page.ScrollingEnabled = false; setFromX(input.Position.X)
+            end
+        end)
+        UIS.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then setFromX(input.Position.X) end
+        end)
+        UIS.InputEnded:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+                dragging = false; page.ScrollingEnabled = true; saveSettings()
+            end
+        end)
+        render(false)
+        table.insert(refreshers, function() render(false) end)
+    end
+
+    local function addOption(page, key, label, options)
+        local row = makeRow(page, 42)
+        rowLabel(row, label, 0.47)
+        local btn = new("TextButton", {
+            Size = UDim2.new(0.47, -6, 0, 27), Position = UDim2.new(0.53, 0, 0.5, -13),
+            BackgroundColor3 = Color3.fromRGB(43, 47, 60), Font = Enum.Font.GothamBold,
+            TextSize = 11, TextColor3 = WHITE, BorderSizePixel = 0, AutoButtonColor = false,
+        }, row)
+        new("UICorner", {CornerRadius = UDim.new(0, 7)}, btn)
+        new("UIStroke", {Color = Color3.fromRGB(76, 82, 99), Transparency = 0.55, Thickness = 1}, btn)
+        local function render() btn.Text = tostring(S[key]) .. "  >" end
+        btn.MouseButton1Click:Connect(function()
+            local idx = table.find(options, S[key]) or 0
+            setSetting(key, options[idx % #options + 1]); render(); saveSettings()
+        end)
+        render(); table.insert(refreshers, render)
+    end
+
+    local function addText(page, titleText, body)
+        local row = new("Frame", {
+            Size = UDim2.new(1, -4, 0, 0),
+            BackgroundColor3 = Color3.fromRGB(21, 24, 32),
+            BorderSizePixel = 0,
+            AutomaticSize = Enum.AutomaticSize.Y,
+        }, page)
+        new("UICorner", {CornerRadius = UDim.new(0, 9)}, row)
+        new("UIStroke", {Color = Color3.fromRGB(74, 40, 52), Thickness = 1, Transparency = 0.4}, row)
+        new("UIPadding", {
+            PaddingTop = UDim.new(0, 10),
+            PaddingBottom = UDim.new(0, 12),
+            PaddingLeft = UDim.new(0, 12),
+            PaddingRight = UDim.new(0, 12),
+        }, row)
+        new("UIListLayout", {
+            Padding = UDim.new(0, 6),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }, row)
+        new("TextLabel", {
+            LayoutOrder = 1,
+            Size = UDim2.new(1, 0, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1,
+            Text = titleText,
+            TextColor3 = Color3.fromRGB(255, 132, 132),
+            Font = Enum.Font.GothamBold,
+            TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            TextWrapped = true,
+        }, row)
+        new("TextLabel", {
+            LayoutOrder = 2,
+            Size = UDim2.new(1, 0, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1,
+            Text = body,
+            TextColor3 = MUTED,
+            Font = Enum.Font.Gotham,
+            TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            TextWrapped = true,
+            LineHeight = 1.15,
+        }, row)
+    end
+
+    for index, group in ipairs(SCHEMA) do
+        local tab = new("TextButton", {
+            Size = UDim2.fromOffset(math.max(66, #group.cat * 7 + 24), 31),
+            BackgroundColor3 = ROW, Text = string.upper(group.cat), Font = Enum.Font.GothamBold,
+            TextSize = 10, TextColor3 = MUTED, BorderSizePixel = 0, AutoButtonColor = false, LayoutOrder = index,
+        }, tabs)
+        new("UICorner", {CornerRadius = UDim.new(0, 8)}, tab)
+        new("UIStroke", {Color = ACC, Thickness = 1, Transparency = 0.85}, tab)
+        tabButtons[group.cat] = tab
+        local page = new("ScrollingFrame", {
+            Name = group.cat .. "Page", Size = UDim2.new(1, -24, 1, -176), Position = UDim2.fromOffset(12, 124),
+            BackgroundTransparency = 1, ScrollBarThickness = 3, ScrollBarImageColor3 = ACC,
+            CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            BorderSizePixel = 0, Visible = false, ScrollingDirection = Enum.ScrollingDirection.Y,
+        }, panel)
+        new("UIListLayout", {Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder}, page)
+        new("UIPadding", {PaddingBottom = UDim.new(0, 6), PaddingRight = UDim.new(0, 3)}, page)
+        pages[group.cat] = page
+        for _, it in ipairs(group.items) do
+            local key, kind, label = it[1], it[2], it[3]
+            if kind == "toggle" then addToggle(page, key, label)
+            elseif kind == "slider" then addSlider(page, key, label, it[4], it[5], it[6])
+            elseif kind == "option" then addOption(page, key, label, it[4])
+            elseif kind == "text" then addText(page, label, it[4]) end
+        end
+        tab.MouseButton1Click:Connect(function() showPage(group.cat) end)
+    end
+
+    local footer = new("Frame", {
+        Size = UDim2.new(1, -24, 0, 42), Position = UDim2.new(0, 12, 1, -49),
+        BackgroundColor3 = Color3.fromRGB(17, 19, 27), BorderSizePixel = 0,
+    }, panel)
+    new("UICorner", {CornerRadius = UDim.new(0, 9)}, footer)
+    new("TextLabel", {
+        Size = UDim2.new(0.4, -6, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+        Text = "F6  /  SETTINGS", TextColor3 = MUTED, Font = Enum.Font.Code, TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, footer)
+    local resetBtn = new("TextButton", {
+        Size = UDim2.new(0.24, -4, 0, 28), Position = UDim2.new(0.46, 0, 0.5, -14),
+        BackgroundColor3 = Color3.fromRGB(45, 49, 60), Text = "RESET", Font = Enum.Font.GothamBold,
+        TextSize = 10, TextColor3 = WHITE, BorderSizePixel = 0, AutoButtonColor = false,
+    }, footer)
+    local saveBtn = new("TextButton", {
+        Size = UDim2.new(0.27, -4, 0, 28), Position = UDim2.new(0.72, 0, 0.5, -14),
+        BackgroundColor3 = ACC, Text = "SAVE", Font = Enum.Font.GothamBold,
+        TextSize = 10, TextColor3 = WHITE, BorderSizePixel = 0, AutoButtonColor = false,
+    }, footer)
+    for _, b in ipairs({resetBtn, saveBtn}) do new("UICorner", {CornerRadius = UDim.new(0, 7)}, b) end
+    new("UIGradient", {Rotation = 0, Color = ColorSequence.new(ACC2, ACC)}, saveBtn)
+    resetBtn.MouseButton1Click:Connect(function()
+        for k, v in pairs(DEFAULTS) do setSetting(k, v) end
+        for _, refresh in ipairs(refreshers) do refresh() end
+        saveSettings()
+        local oldText = resetBtn.Text; resetBtn.Text = "RESET DONE"
+        task.delay(0.9, function() if resetBtn.Parent then resetBtn.Text = oldText end end)
+    end)
+    saveBtn.MouseButton1Click:Connect(function()
+        saveSettings(); saveBtn.Text = "SAVED"
+        task.delay(0.9, function() if saveBtn.Parent then saveBtn.Text = "SAVE" end end)
+    end)
+
+    local gear = new("TextButton", {
+        Name = "OpenSettings", Size = UDim2.fromOffset(48, 48), Position = UDim2.new(0, 16, 0.5, -24),
+        BackgroundColor3 = BG, Text = "SET", TextSize = 11, TextColor3 = WHITE,
+        Font = Enum.Font.GothamBlack, BorderSizePixel = 0, AutoButtonColor = false,
+    }, ui)
+    new("UICorner", {CornerRadius = UDim.new(0, 13)}, gear)
+    new("UIStroke", {Color = ACC, Thickness = 1.5, Transparency = 0.12}, gear)
+    new("UIGradient", {Rotation = 35, Color = ColorSequence.new(Color3.fromRGB(45, 25, 36), BG)}, gear)
+
+    local opened = false
+    local function toggle()
+        opened = not opened
+        if opened then
+            panel.Visible = true
+            panel.Size = UDim2.new(0, 410, 0, 480)
+            panel.BackgroundTransparency = 0.08
+            panel.Position = UDim2.new(0.5, -205, 0.5, -240)
+            tween(panel, 0.24, {Size = UDim2.new(0, 430, 0, 510), Position = UDim2.new(0.5, -215, 0.5, -255), BackgroundTransparency = 0}, Enum.EasingStyle.Back)
+        else
+            local tw = tween(panel, 0.16, {Size = UDim2.new(0, 410, 0, 480), BackgroundTransparency = 0.12}, Enum.EasingStyle.Quad)
+            tw.Completed:Connect(function() if not opened then panel.Visible = false end end)
+        end
+    end
+    gear.MouseButton1Click:Connect(toggle)
+    close.MouseButton1Click:Connect(toggle)
+    UIS.InputBegan:Connect(function(input, gp)
+        if not gp and input.KeyCode == Enum.KeyCode.F6 then toggle() end
+    end)
+
+    local dragging, dragStart, startPos = false, nil, nil
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, panel.Position
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    end)
+    showPage(SCHEMA[1].cat)
+end
+
+buildSettingsUI()
